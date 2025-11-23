@@ -1,0 +1,123 @@
+name: Build OpenWrt .ipk (trafficmon)
+
+# 觸發：push 到 main 或手動 workflow_dispatch
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  # 可修改為你要的 OpenWrt 版本/分支/標籤
+  OPENWRT_REF: "openwrt-24.10"
+  # 若你要用特定 OpenWrt repo url（例如 fork），可在此改
+  OPENWRT_REPO: "https://git.openwrt.org/openwrt/openwrt.git"
+  # 要編譯的 package 路徑（相對於 repo 根目錄）
+  PKG_PATH_IN_REPO: "package/trafficmon"
+  # package 名稱，用於 make 的目標
+  PKG_NAME: "trafficmon"
+  # 可修改 parallel jobs
+  JOBS: 2
+
+jobs:
+  build-ipk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # 大型編譯可能需要較長時間；視需要調整
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Install build dependencies (apt)
+      run: |
+        sudo apt-get update -y
+        sudo apt-get install -y build-essential libncurses-dev gawk gettext unzip file \
+          python3-distutils git-core subversion mercurial ccache ecj fastjar \
+          python3 python3-pip python3-setuptools pkg-config rsync
+        # optional helpful tools
+        sudo apt-get install -y zip
+
+    - name: Print environment
+      run: |
+        echo "OPENWRT_REPO=${{ env.OPENWRT_REPO }}"
+        echo "OPENWRT_REF=${{ env.OPENWRT_REF }}"
+        echo "PKG_PATH_IN_REPO=${{ env.PKG_PATH_IN_REPO }}"
+
+    - name: Clone OpenWrt tree (shallow)
+      run: |
+        # clone OpenWrt; if branch/tag doesn't exist this will fail — 可更改 OPENWRT_REF
+        git clone --single-branch --branch "${OPENWRT_REF}" --depth 1 "${OPENWRT_REPO}" openwrt
+      env:
+        OPENWRT_REPO: ${{ env.OPENWRT_REPO }}
+        OPENWRT_REF: ${{ env.OPENWRT_REF }}
+
+    - name: Copy package into OpenWrt package folder
+      run: |
+        set -e
+        if [ ! -d "${{ env.PKG_PATH_IN_REPO }}" ]; then
+          echo "Package path '${{ env.PKG_PATH_IN_REPO }}' not found in repo. Please place your package there."
+          ls -la
+          exit 1
+        fi
+        mkdir -p openwrt/package
+        # copy package tree (overwrite if exists)
+        rsync -a --delete "${{ env.PKG_PATH_IN_REPO }}/" openwrt/package/${{ env.PKG_NAME }}/
+        echo "Copied package to openwrt/package/${{ env.PKG_NAME }}/"
+
+    - name: Enter OpenWrt dir and update feeds
+      working-directory: openwrt
+      run: |
+        set -e
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    - name: Prepare build (optional: set defaults)
+      working-directory: openwrt
+      run: |
+        set -e
+        # ensure proper build dir permissions for GitHub
+        mkdir -p tmp
+        # You can optionally enable the package in .config here using scripts/config or editing .config
+        # For simplicity we will directly build the package target (no menuconfig)
+        true
+
+    - name: Compile target package
+      working-directory: openwrt
+      run: |
+        set -e
+        # Make package compile (this will only build the package and required deps)
+        # We use V=s to see verbose output; adjust JOBS for parallelism
+        make package/${PKG_NAME}/compile V=s -j${JOBS}
+      env:
+        PKG_NAME: ${{ env.PKG_NAME }}
+        JOBS: ${{ env.JOBS }}
+
+    - name: Find built .ipk artifacts
+      working-directory: openwrt
+      id: find_ipk
+      run: |
+        set -e
+        echo "Searching for ipk files..."
+        ipk=$(find bin -type f -name "${PKG_NAME}_*.ipk" | head -n 1 || true)
+        if [ -z "$ipk" ]; then
+          echo "No ipk found in bin/ — listing bin/:"
+          ls -la bin || true
+          exit 1
+        fi
+        echo "IPK_PATH=$ipk" >> $GITHUB_OUTPUT
+        echo "Found ipk: $ipk"
+
+    - name: Upload artifact (.ipk)
+      uses: actions/upload-artifact@v4
+      with:
+        name: trafficmon-ipk
+        path: openwrt/${{ steps.find_ipk.outputs.IPK_PATH }}
+
+    - name: Upload build logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: openwrt-build-log
+        path: openwrt/build_dir || true
