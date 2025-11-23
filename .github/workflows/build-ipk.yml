@@ -12,9 +12,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - x86_64
-          - mediatek_filogic
+        include:
+          - target: x86_64
+            rust_target: x86_64-unknown-linux-musl
+            openwrt_arch: x86_64
+          - target: mediatek_filogic
+            rust_target: aarch64-unknown-linux-musl
+            openwrt_arch: aarch64_cortex-a53
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -22,14 +26,22 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential git curl unzip python3 libncurses5-dev gawk gettext libssl-dev xsltproc wget zstd
+          sudo apt-get install -y build-essential git curl unzip python3 libncurses5-dev gawk gettext libssl-dev xsltproc wget zstd musl-tools
 
       - name: Install Rust toolchain
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
           source "$HOME/.cargo/env"
+          rustup target add ${{ matrix.rust_target }}
           rustc --version
           cargo --version
+
+      - name: Build Rust binary
+        run: |
+          source "$HOME/.cargo/env"
+          cargo build --release --target ${{ matrix.rust_target }}
+          ls -lh target/${{ matrix.rust_target }}/release/
+          file target/${{ matrix.rust_target }}/release/trafficmon
 
       - name: Download OpenWrt SDK
         run: |
@@ -46,29 +58,64 @@ jobs:
           tar --zstd -xf sdk.tar.zst
           mv openwrt-sdk-* sdk
 
-      - name: Copy package
+      - name: Prepare package with prebuilt binary
         run: |
-          echo "Checking repository structure..."
-          ls -la
-          
-          # Copy package to SDK
+          # Copy package definition
           mkdir -p sdk/package/trafficmon
           cp -r package/trafficmon/* sdk/package/trafficmon/
           
-          echo "Package copied, verifying..."
-          ls -la sdk/package/trafficmon/
+          # Create a simplified Makefile that uses prebuilt binary
+          cat > sdk/package/trafficmon/Makefile << 'EOF'
+include $(TOPDIR)/rules.mk
+
+PKG_NAME:=trafficmon
+PKG_VERSION:=0.1.0
+PKG_RELEASE:=1
+
+include $(INCLUDE_DIR)/package.mk
+
+define Package/trafficmon
+  SECTION:=utils
+  CATEGORY:=Utilities
+  TITLE:=Rust-based NFT traffic monitor
+  DEPENDS:=+libc
+endef
+
+define Package/trafficmon/description
+  Monitor traffic on eth1 and pppoe-wan using nftables counters.
+endef
+
+define Build/Prepare
+	mkdir -p $(PKG_BUILD_DIR)
+endef
+
+define Build/Configure
+endef
+
+define Build/Compile
+endef
+
+define Package/trafficmon/install
+	$(INSTALL_DIR) $(1)/usr/bin
+	$(INSTALL_BIN) $(TOPDIR)/../prebuilt/trafficmon $(1)/usr/bin/trafficmon
+	$(INSTALL_DIR) $(1)/etc/init.d
+	$(INSTALL_BIN) $(TOPDIR)/../package/trafficmon/files/trafficmon.init $(1)/etc/init.d/trafficmon
+endef
+
+$(eval $(call BuildPackage,trafficmon))
+EOF
+          
+          # Copy prebuilt binary
+          mkdir -p sdk/prebuilt
+          cp target/${{ matrix.rust_target }}/release/trafficmon sdk/prebuilt/
+          chmod +x sdk/prebuilt/trafficmon
 
       - name: Build package
         working-directory: sdk
         run: |
-          # Load Rust environment
-          source "$HOME/.cargo/env"
           ./scripts/feeds update -a
           ./scripts/feeds install -a
           make defconfig
-          # Check if package exists
-          ls -la package/trafficmon/
-          # Enable the package
           echo "CONFIG_PACKAGE_trafficmon=m" >> .config
           make defconfig
           make package/trafficmon/compile -j$(nproc) V=s
