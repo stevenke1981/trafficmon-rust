@@ -24,6 +24,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential git curl unzip python3 libncurses5-dev gawk gettext libssl-dev xsltproc wget zstd
 
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          source "$HOME/.cargo/env"
+          rustc --version
+          cargo --version
+
       - name: Download OpenWrt SDK
         run: |
           case "${{ matrix.target }}" in
@@ -41,13 +48,22 @@ jobs:
 
       - name: Copy package
         run: |
-          cp -r package/ sdk/package/
+          mkdir -p sdk/package/trafficmon-rust
+          cp -r package/trafficmon-rust/* sdk/package/trafficmon-rust/
+          ls -la sdk/package/trafficmon-rust/
 
       - name: Build package
         working-directory: sdk
         run: |
+          # Load Rust environment
+          source "$HOME/.cargo/env"
           ./scripts/feeds update -a
           ./scripts/feeds install -a
+          make defconfig
+          # Check if package exists
+          ls -la package/trafficmon-rust/
+          # Enable the package
+          echo "CONFIG_PACKAGE_trafficmon-rust=m" >> .config
           make defconfig
           make package/trafficmon-rust/compile -j$(nproc) V=s
 
