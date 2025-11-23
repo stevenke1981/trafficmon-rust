@@ -1,4 +1,4 @@
-name: Build trafficmon-rust for multi-platform and release
+name: Build trafficmon-rust multi-platform and release
 
 on:
   push:
@@ -15,7 +15,7 @@ jobs:
       matrix:
         target:
           - x86_64
-          - aarch64_cortex-a53
+          - mediatek_filogic
 
     steps:
       - name: Checkout repository
@@ -34,8 +34,8 @@ jobs:
             x86_64)
               TARGET_PATH="x86/64"
               ;;
-            aarch64_cortex-a53)
-              TARGET_PATH="armsr/armv8"
+            mediatek_filogic)
+              TARGET_PATH="mediatek/filogic"
               ;;
           esac
 
@@ -44,9 +44,9 @@ jobs:
 
           SDK_FILE=$(curl -s $FULL_URL | grep -o 'openwrt-sdk-.*\.tar\.xz' | head -n 1)
 
-          echo "Downloading SDK file: $SDK_FILE"
-          wget "$FULL_URL$SDK_FILE"
+          echo "Found SDK file: $SDK_FILE"
 
+          wget "$FULL_URL$SDK_FILE"
           tar -xf "$SDK_FILE"
           mv openwrt-sdk-* openwrt-sdk-${{ matrix.target }}
 
@@ -68,7 +68,7 @@ jobs:
           make defconfig
           make package/trafficmon-rust/compile V=s
 
-      - name: Upload per-target IPK
+      - name: Upload target artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ipk-${{ matrix.target }}
@@ -90,6 +90,6 @@ jobs:
           name: Build ${{ github.ref_name }}
           files: |
             ipk-x86_64/*.ipk
-            ipk-aarch64_cortex-a53/*.ipk
+            ipk-mediatek_filogic/*.ipk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
