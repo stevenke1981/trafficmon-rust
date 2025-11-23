@@ -48,9 +48,15 @@ jobs:
 
       - name: Copy package
         run: |
-          mkdir -p sdk/package/trafficmon-rust
-          cp -r package/trafficmon-rust/* sdk/package/trafficmon-rust/
-          ls -la sdk/package/trafficmon-rust/
+          echo "Checking repository structure..."
+          ls -la
+          
+          # Copy package to SDK
+          mkdir -p sdk/package/trafficmon
+          cp -r package/trafficmon/* sdk/package/trafficmon/
+          
+          echo "Package copied, verifying..."
+          ls -la sdk/package/trafficmon/
 
       - name: Build package
         working-directory: sdk
@@ -61,17 +67,17 @@ jobs:
           ./scripts/feeds install -a
           make defconfig
           # Check if package exists
-          ls -la package/trafficmon-rust/
+          ls -la package/trafficmon/
           # Enable the package
-          echo "CONFIG_PACKAGE_trafficmon-rust=m" >> .config
+          echo "CONFIG_PACKAGE_trafficmon=m" >> .config
           make defconfig
-          make package/trafficmon-rust/compile -j$(nproc) V=s
+          make package/trafficmon/compile -j$(nproc) V=s
 
       - name: Upload ipk
         uses: actions/upload-artifact@v4
         with:
           name: ipk-${{ matrix.target }}
-          path: sdk/bin/packages/**/trafficmon-rust*.ipk
+          path: sdk/bin/packages/**/trafficmon*.ipk
 
   create-feed:
     runs-on: ubuntu-latest
