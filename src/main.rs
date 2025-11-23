@@ -1,74 +1,89 @@
 use serde::Serialize;
-use tokio::process::Command;
+use std::process::Command;
+use std::fs::File;
+use std::io::Write;
 use tokio::time::{sleep, Duration};
 
-const NFT_TABLE: &str = "trafficmon";
-const JSON_OUTPUT: &str = "/var/run/trafficmon.json";
+const OUTPUT_PATH: &str = "/var/run/trafficmon.json";
+const INTERFACES: &[&str] = &["eth1", "pppoe-wan"];
+
+#[derive(Serialize)]
+struct IfaceData {
+    iface: String,
+    rx: u64,
+    tx: u64,
+}
 
 #[derive(Serialize)]
 struct TrafficData {
-    eth1: u64,
-    pppoe_wan: u64,
+    data: Vec<IfaceData>,
 }
 
-async fn nft_cmd(args: &[&str]) {
-    let _ = Command::new("nft")
-        .args(args)
-        .output()
-        .await;
-}
-
-async fn setup_nft() {
-    nft_cmd(&["add", "table", "ip", NFT_TABLE]).await;
-    nft_cmd(&["add", "chain", "ip", NFT_TABLE, "monitor", "{ type filter hook prerouting priority 0; }"]).await;
-
-    nft_cmd(&["add", "counter", "ip", NFT_TABLE, "eth1_counter"]).await;
-    nft_cmd(&["add", "counter", "ip", NFT_TABLE, "pppoe_counter"]).await;
-
-    nft_cmd(&["add", "rule", "ip", NFT_TABLE, "monitor",
-              "iifname", "eth1", "counter", "name", "eth1_counter"]).await;
-
-    nft_cmd(&["add", "rule", "ip", NFT_TABLE, "monitor",
-              "iifname", "pppoe-wan", "counter", "name", "pppoe_counter"]).await;
-
-    nft_cmd(&["reset", "counters", "table", "ip", NFT_TABLE]).await;
-}
-
-async fn read_counter(counter: &str) -> u64 {
+fn read_nft_counter(name: &str) -> (u64, u64) {
     let output = Command::new("nft")
-        .args(["list", "counter", "ip", NFT_TABLE, counter])
-        .output()
-        .await
-        .unwrap();
+        .args(["list", "counter", "inet", "trafficmon", name])
+        .output();
 
-    let text = String::from_utf8_lossy(&output.stdout);
+    if let Ok(out) = output {
+        let txt = String::from_utf8_lossy(&out.stdout);
 
-    for line in text.lines() {
-        if line.contains("packets") {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 4 {
-                return parts[3].parse::<u64>().unwrap_or(0);
-            }
-        }
+        let rx = txt
+            .lines()
+            .find(|l| l.contains("packets"))
+            .and_then(|line| {
+                line.split_whitespace()
+                    .nth(1)
+                    .unwrap_or("0")
+                    .parse::<u64>()
+                    .ok()
+            })
+            .unwrap_or(0);
+
+        let tx = txt
+            .lines()
+            .find(|l| l.contains("bytes"))
+            .and_then(|line| {
+                line.split_whitespace()
+                    .nth(1)
+                    .unwrap_or("0")
+                    .parse::<u64>()
+                    .ok()
+            })
+            .unwrap_or(0);
+
+        (rx, tx)
+    } else {
+        (0, 0)
     }
-    0
+}
+
+fn reset_nft() {
+    let _ = Command::new("nft")
+        .args(["reset", "counters", "inet", "trafficmon"])
+        .output();
 }
 
 #[tokio::main]
 async fn main() {
-    setup_nft().await;
+    reset_nft();
 
     loop {
-        let eth1 = read_counter("eth1_counter").await;
-        let pppoe = read_counter("pppoe_counter").await;
+        let mut result = TrafficData { data: vec![] };
 
-        let data = TrafficData {
-            eth1,
-            pppoe_wan: pppoe,
-        };
+        for iface in INTERFACES {
+            let cname = format!("cnt_{}", iface);
+            let (rx, tx) = read_nft_counter(&cname);
 
-        let json = serde_json::to_string_pretty(&data).unwrap();
-        tokio::fs::write(JSON_OUTPUT, json).await.unwrap();
+            result.data.push(IfaceData {
+                iface: iface.to_string(),
+                rx,
+                tx,
+            });
+        }
+
+        if let Ok(mut f) = File::create(OUTPUT_PATH) {
+            let _ = f.write_all(serde_json::to_string(&result).unwrap().as_bytes());
+        }
 
         sleep(Duration::from_secs(5)).await;
     }
