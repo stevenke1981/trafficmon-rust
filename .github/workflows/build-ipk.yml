@@ -1,13 +1,21 @@
-name: Build trafficmon-rust IPK
+name: Build trafficmon-rust for multi-platform and release
 
 on:
   push:
     branches: [ "main" ]
+    tags: [ "*" ]
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64
+          - aarch64_cortex-a53
 
     steps:
       - name: Checkout repository
@@ -18,34 +26,70 @@ jobs:
           sudo apt update
           sudo apt install -y build-essential git curl unzip python3
 
-      - name: Download OpenWrt SDK
+      - name: Download latest OpenWrt SDK
         run: |
-          wget https://downloads.openwrt.org/releases/24.10.0/targets/x86/64/openwrt-24.10.0-x86-64-generic-sdk.tar.xz
-          tar -xf openwrt-24.10.0-x86-64-generic-sdk.tar.xz
-          mv openwrt-sdk-* openwrt-sdk
+          BASE_URL="https://downloads.openwrt.org/releases/24.10-SNAPSHOT/targets"
+
+          case "${{ matrix.target }}" in
+            x86_64)
+              TARGET_PATH="x86/64"
+              ;;
+            aarch64_cortex-a53)
+              TARGET_PATH="armsr/armv8"
+              ;;
+          esac
+
+          FULL_URL="$BASE_URL/$TARGET_PATH/"
+          echo "SDK URL: $FULL_URL"
+
+          SDK_FILE=$(curl -s $FULL_URL | grep -o 'openwrt-sdk-.*\.tar\.xz' | head -n 1)
+
+          echo "Downloading SDK file: $SDK_FILE"
+          wget "$FULL_URL$SDK_FILE"
+
+          tar -xf "$SDK_FILE"
+          mv openwrt-sdk-* openwrt-sdk-${{ matrix.target }}
 
       - name: Copy package into SDK
         run: |
-          mkdir -p openwrt-sdk/package/trafficmon-rust
-          cp -r package/trafficmon-rust/* openwrt-sdk/package/trafficmon-rust/
+          cp -r package/ openwrt-sdk-${{ matrix.target }}/package/
 
-      - name: Copy Rust source into SDK package
+      - name: Copy Rust source
         run: |
-          mkdir -p openwrt-sdk/package/trafficmon-rust/src
-          cp -r src/* openwrt-sdk/package/trafficmon-rust/src/
-          cp Cargo.toml openwrt-sdk/package/trafficmon-rust/
+          mkdir -p openwrt-sdk-${{ matrix.target }}/package/trafficmon-rust/src
+          cp -r src/* openwrt-sdk-${{ matrix.target }}/package/trafficmon-rust/src/
+          cp Cargo.toml openwrt-sdk-${{ matrix.target }}/package/trafficmon-rust/
 
       - name: Build package
-        working-directory: openwrt-sdk
+        working-directory: openwrt-sdk-${{ matrix.target }}
         run: |
-          echo "src-git rust https://github.com/openwrt/packages" >> feeds.conf.default
           ./scripts/feeds update -a
           ./scripts/feeds install -a
           make defconfig
           make package/trafficmon-rust/compile V=s
 
-      - name: Upload IPK Artifact
+      - name: Upload per-target IPK
         uses: actions/upload-artifact@v4
         with:
-          name: trafficmon-rust-ipk
-          path: openwrt-sdk/bin/packages/**/trafficmon-rust*.ipk
+          name: ipk-${{ matrix.target }}
+          path: openwrt-sdk-${{ matrix.target }}/bin/packages/**/trafficmon-rust*.ipk
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Create Release and Upload Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Build ${{ github.ref_name }}
+          files: |
+            ipk-x86_64/*.ipk
+            ipk-aarch64_cortex-a53/*.ipk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
