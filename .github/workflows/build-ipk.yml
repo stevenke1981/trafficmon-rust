@@ -1,7 +1,7 @@
 name: Build trafficmon-rust & feed server
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
     tags:
       - "v*"
   workflow_dispatch:
@@ -58,73 +58,56 @@ jobs:
           tar --zstd -xf sdk.tar.zst
           mv openwrt-sdk-* sdk
 
-      - name: Prepare package with prebuilt binary
+      - name: Prepare package directory
         run: |
-          # Copy package definition
-          mkdir -p sdk/package/trafficmon
-          cp -r package/trafficmon/* sdk/package/trafficmon/
-          
-          # Create a simplified Makefile that uses prebuilt binary
-          cat > sdk/package/trafficmon/Makefile << 'EOF'
-include $(TOPDIR)/rules.mk
+          mkdir -p sdk/package/trafficmon/files
+          mkdir -p sdk/package/trafficmon/prebuilt
+          if [ -d "package/trafficmon/files" ]; then
+            cp -r package/trafficmon/files/* sdk/package/trafficmon/files/
+          fi
+          cp target/${{ matrix.rust_target }}/release/trafficmon sdk/package/trafficmon/prebuilt/
+          chmod +x sdk/package/trafficmon/prebuilt/trafficmon
 
-PKG_NAME:=trafficmon
-PKG_VERSION:=0.1.0
-PKG_RELEASE:=1
-
-include $(INCLUDE_DIR)/package.mk
-
-define Package/trafficmon
-  SECTION:=utils
-  CATEGORY:=Utilities
-  TITLE:=Rust-based NFT traffic monitor
-  DEPENDS:=+libc
-endef
-
-define Package/trafficmon/description
-  Monitor traffic on eth1 and pppoe-wan using nftables counters.
-endef
-
-define Build/Prepare
-	mkdir -p $(PKG_BUILD_DIR)
-endef
-
-define Build/Configure
-endef
-
-define Build/Compile
-endef
-
-define Package/trafficmon/install
-	$(INSTALL_DIR) $(1)/usr/bin
-	$(INSTALL_BIN) $(TOPDIR)/../prebuilt/trafficmon $(1)/usr/bin/trafficmon
-	$(INSTALL_DIR) $(1)/etc/init.d
-	$(INSTALL_BIN) $(TOPDIR)/../package/trafficmon/files/trafficmon.init $(1)/etc/init.d/trafficmon
-endef
-
-$(eval $(call BuildPackage,trafficmon))
-EOF
-          
-          # Copy prebuilt binary
-          mkdir -p sdk/prebuilt
-          cp target/${{ matrix.rust_target }}/release/trafficmon sdk/prebuilt/
-          chmod +x sdk/prebuilt/trafficmon
+      - name: Create package Makefile
+        run: |
+          cat > sdk/package/trafficmon/Makefile << 'ENDOFFILE'
+          include $(TOPDIR)/rules.mk
+          PKG_NAME:=trafficmon
+          PKG_VERSION:=0.1.0
+          PKG_RELEASE:=1
+          include $(INCLUDE_DIR)/package.mk
+          define Package/trafficmon
+            SECTION:=utils
+            CATEGORY:=Utilities
+            TITLE:=Rust-based NFT traffic monitor
+            DEPENDS:=+libc
+          endef
+          define Build/Prepare
+          endef
+          define Build/Configure
+          endef
+          define Build/Compile
+          endef
+          define Package/trafficmon/install
+          	$(INSTALL_DIR) $(1)/usr/bin
+          	$(INSTALL_BIN) ./prebuilt/trafficmon $(1)/usr/bin/trafficmon
+          	$(INSTALL_DIR) $(1)/etc/init.d
+          	$(INSTALL_BIN) ./files/trafficmon.init $(1)/etc/init.d/trafficmon
+          endef
+          $(eval $(call BuildPackage,trafficmon))
+          ENDOFFILE
+          echo "Makefile created"
+          cat sdk/package/trafficmon/Makefile
 
       - name: Build package
         working-directory: sdk
         run: |
-          # Update feeds but don't install rust
           ./scripts/feeds update -a
           ./scripts/feeds install -a -p packages -f
-          
-          # Remove rust from feeds to prevent compilation
           rm -rf feeds/packages/lang/rust
-          
           make defconfig
           echo "CONFIG_PACKAGE_trafficmon=m" >> .config
           make defconfig
-          
-          # Build only our package
           make package/trafficmon/compile -j$(nproc) V=s
 
       - name: Upload ipk
