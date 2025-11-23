@@ -1,9 +1,10 @@
-name: Build trafficmon-rust multi-platform and release
+name: Build trafficmon-rust & feed server
 
 on:
   push:
     branches: [ "main" ]
-    tags: [ "*" ]
+  tags:
+    - "v*"
   workflow_dispatch:
 
 jobs:
@@ -18,7 +19,7 @@ jobs:
           - mediatek_filogic
 
     steps:
-      - name: Checkout repository
+      - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install dependencies
@@ -26,9 +27,9 @@ jobs:
           sudo apt update
           sudo apt install -y build-essential git curl unzip python3
 
-      - name: Download latest OpenWrt SDK
+      - name: Download OpenWrt SDK
         run: |
-          BASE_URL="https://downloads.openwrt.org/releases/24.10-SNAPSHOT/targets"
+          BASE_URL="https://downloads.openwrt.org/releases/24.10.0/targets"
 
           case "${{ matrix.target }}" in
             x86_64)
@@ -43,53 +44,66 @@ jobs:
           echo "SDK URL: $FULL_URL"
 
           SDK_FILE=$(curl -s $FULL_URL | grep -o 'openwrt-sdk-.*\.tar\.xz' | head -n 1)
-
-          echo "Found SDK file: $SDK_FILE"
+          echo "SDK found: $SDK_FILE"
 
           wget "$FULL_URL$SDK_FILE"
           tar -xf "$SDK_FILE"
-          mv openwrt-sdk-* openwrt-sdk-${{ matrix.target }}
+          mv openwrt-sdk-* sdk
 
-      - name: Copy package into SDK
+      - name: Copy package
         run: |
-          cp -r package/ openwrt-sdk-${{ matrix.target }}/package/
-
-      - name: Copy Rust source
-        run: |
-          mkdir -p openwrt-sdk-${{ matrix.target }}/package/trafficmon-rust/src
-          cp -r src/* openwrt-sdk-${{ matrix.target }}/package/trafficmon-rust/src/
-          cp Cargo.toml openwrt-sdk-${{ matrix.target }}/package/trafficmon-rust/
+          cp -r package/ sdk/package/
 
       - name: Build package
-        working-directory: openwrt-sdk-${{ matrix.target }}
+        working-directory: sdk
         run: |
           ./scripts/feeds update -a
           ./scripts/feeds install -a
           make defconfig
-          make package/trafficmon-rust/compile V=s
+          make package/trafficmon-rust/compile -j$(nproc) V=s
 
-      - name: Upload target artifacts
+      - name: Upload ipk
         uses: actions/upload-artifact@v4
         with:
           name: ipk-${{ matrix.target }}
-          path: openwrt-sdk-${{ matrix.target }}/bin/packages/**/trafficmon-rust*.ipk
+          path: sdk/bin/packages/**/trafficmon-rust*.ipk
 
-  release:
-    needs: build
+  create-feed:
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main'
+    needs: build
 
     steps:
-      - name: Download build artifacts
+      - name: Download artifacts
         uses: actions/download-artifact@v4
 
-      - name: Create Release and Upload Assets
-        uses: softprops/action-gh-release@v2
+      - name: Create feed structure
+        run: |
+          mkdir -p feed
+          cp ipk-*/trafficmon-rust*.ipk feed/
+
+          cd feed
+          opkg-make-index . > Packages
+          gzip -9c Packages > Packages.gz
+
+      - name: Upload feed
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: ${{ github.ref_name }}
-          name: Build ${{ github.ref_name }}
-          files: |
-            ipk-x86_64/*.ipk
-            ipk-mediatek_filogic/*.ipk
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: feed
+          path: feed/
+
+  publish-feed:
+    runs-on: ubuntu-latest
+    needs: create-feed
+
+    steps:
+      - name: Download feed
+        uses: actions/download-artifact@v4
+        with:
+          name: feed
+          path: public
+
+      - name: Publish to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./public
