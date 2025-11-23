@@ -22,25 +22,21 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential git curl unzip python3 libncurses5-dev gawk gettext libssl-dev xsltproc wget
+          sudo apt-get install -y build-essential git curl unzip python3 libncurses5-dev gawk gettext libssl-dev xsltproc wget zstd
 
       - name: Download OpenWrt SDK
         run: |
-          BASE_URL="https://downloads.openwrt.org/releases/24.10.0/targets"
           case "${{ matrix.target }}" in
             x86_64)
-              TARGET_PATH="x86/64"
+              SDK_URL="https://downloads.openwrt.org/releases/24.10.0/targets/x86/64/openwrt-sdk-24.10.0-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst"
               ;;
             mediatek_filogic)
-              TARGET_PATH="mediatek/filogic"
+              SDK_URL="https://downloads.openwrt.org/releases/24.10.0/targets/mediatek/filogic/openwrt-sdk-24.10.0-mediatek-filogic_gcc-13.3.0_musl.Linux-x86_64.tar.zst"
               ;;
           esac
-          FULL_URL="$BASE_URL/$TARGET_PATH/"
-          echo "SDK URL: $FULL_URL"
-          SDK_FILE=$(curl -s $FULL_URL | grep -o 'openwrt-sdk-[^"]*\.tar\.xz' | head -n 1)
-          echo "SDK found: $SDK_FILE"
-          wget "$FULL_URL$SDK_FILE"
-          tar -xf "$SDK_FILE"
+          echo "Downloading SDK from: $SDK_URL"
+          wget "$SDK_URL" -O sdk.tar.zst
+          tar --zstd -xf sdk.tar.zst
           mv openwrt-sdk-* sdk
 
       - name: Copy package
