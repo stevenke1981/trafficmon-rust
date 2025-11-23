@@ -113,11 +113,18 @@ EOF
       - name: Build package
         working-directory: sdk
         run: |
+          # Update feeds but don't install rust
           ./scripts/feeds update -a
-          ./scripts/feeds install -a
+          ./scripts/feeds install -a -p packages -f
+          
+          # Remove rust from feeds to prevent compilation
+          rm -rf feeds/packages/lang/rust
+          
           make defconfig
           echo "CONFIG_PACKAGE_trafficmon=m" >> .config
           make defconfig
+          
+          # Build only our package
           make package/trafficmon/compile -j$(nproc) V=s
 
       - name: Upload ipk
