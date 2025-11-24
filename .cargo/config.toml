@@ -4,6 +4,9 @@
 [target.aarch64-unknown-linux-musl]
 linker = "aarch64-linux-gnu-gcc"
 
+[target.aarch64-unknown-linux-musl]
+linker = "aarch64-linux-gnu-gcc"
+
 [target.arm-unknown-linux-musleabi]
 linker = "arm-linux-gnueabi-gcc"
 

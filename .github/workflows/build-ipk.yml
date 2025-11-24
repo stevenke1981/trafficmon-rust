@@ -92,7 +92,9 @@ jobs:
           wget \
           xsltproc \
           zlib1g-dev \
-          zstd
+          zstd \
+          gcc-aarch64-linux-gnu \
+          g++-aarch64-linux-gnu
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
