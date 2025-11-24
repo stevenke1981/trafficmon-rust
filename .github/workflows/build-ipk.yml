@@ -14,7 +14,9 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     strategy:
+      fail-fast: false
       matrix:
         include:
           - arch: x86_64
@@ -33,11 +35,33 @@ jobs:
 
     - name: Free disk space
       run: |
-        sudo rm -rf /usr/share/dotnet
-        sudo rm -rf /opt/ghc
-        sudo rm -rf /usr/local/share/boost
-        sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+        echo "=== Before cleanup ==="
         df -h
+        
+        echo "=== Removing unnecessary packages ==="
+        sudo apt-get remove -y '^aspnetcore-.*' '^dotnet-.*' '^llvm-.*' 'php.*' '^mongodb-.*' '^mysql-.*' azure-cli google-chrome-stable firefox powershell mono-devel libgl1-mesa-dri || true
+        sudo apt-get autoremove -y
+        sudo apt-get clean
+        
+        echo "=== Removing large directories ==="
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /usr/local/lib/android
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /opt/hostedtoolcache/CodeQL
+        sudo rm -rf /usr/local/share/boost
+        sudo rm -rf /usr/share/swift
+        sudo rm -rf /usr/local/.ghcup
+        sudo rm -rf /usr/local/share/chromium
+        sudo rm -rf /usr/local/lib/node_modules
+        sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+        
+        echo "=== Cleaning docker ==="
+        docker rmi $(docker images -q) || true
+        
+        echo "=== After cleanup ==="
+        df -h
+        echo "=== Available space in root ==="
+        df -h / | tail -1 | awk '{print "Available: " $4}'
 
     - name: Install dependencies
       run: |
@@ -59,7 +83,6 @@ jobs:
           libncursesw5-dev \
           libssl-dev \
           python3 \
-          python3-distutils \
           python3-setuptools \
           python3-dev \
           rsync \
@@ -85,11 +108,21 @@ jobs:
           target
         key: ${{ runner.os }}-cargo-${{ matrix.rust_target }}-${{ hashFiles('**/Cargo.lock') }}
 
+    - name: Cache OpenWrt SDK
+      id: cache-sdk
+      uses: actions/cache@v4
+      with:
+        path: sdk
+        key: openwrt-sdk-${{ matrix.sdk_name }}-${{ hashFiles('.github/workflows/build.yml') }}
+        restore-keys: |
+          openwrt-sdk-${{ matrix.sdk_name }}-
+
     - name: Download and extract OpenWrt SDK
+      if: steps.cache-sdk.outputs.cache-hit != 'true'
       run: |
         SDK_URL="${{ env.MIRROR_URL }}/${{ matrix.target }}/${{ matrix.sdk_name }}"
         echo "Downloading SDK from: $SDK_URL"
-        wget -q "$SDK_URL"
+        wget -q --show-progress "$SDK_URL"
         
         echo "Extracting SDK..."
         tar --zstd -xf "${{ matrix.sdk_name }}"
@@ -98,10 +131,22 @@ jobs:
         mv "$SDK_DIR" sdk
         rm "${{ matrix.sdk_name }}"
         
-        echo "SDK extracted to: sdk/"
-        ls -la sdk/
+        echo "SDK extracted successfully"
+
+    - name: Verify SDK exists
+      run: |
+        if [ ! -d "sdk" ]; then
+          echo "Error: SDK directory not found"
+          exit 1
+        fi
+        echo "SDK directory found:"
+        ls -la sdk/ | head -20
+        
+        echo "=== Disk space after SDK ==="
+        df -h / | tail -1
 
     - name: Update SDK feeds
+      if: steps.cache-sdk.outputs.cache-hit != 'true'
       run: |
         cd sdk
         
@@ -112,13 +157,15 @@ jobs:
           cat feeds.conf.default
         fi
         
-        # 更新 feeds
-        ./scripts/feeds update -a || true
-        ./scripts/feeds install -a || true
+        # 更新 feeds (限制時間)
+        timeout 300 ./scripts/feeds update -a || echo "Feed update timed out, continuing..."
+        timeout 300 ./scripts/feeds install -a || echo "Feed install timed out, continuing..."
 
     - name: Build Rust binary
       env:
         CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        CARGO_INCREMENTAL: 0
+        CARGO_NET_RETRY: 10
       run: |
         echo "Building for target: ${{ matrix.rust_target }}"
         cargo build --release --target ${{ matrix.rust_target }}
@@ -127,6 +174,13 @@ jobs:
         echo "Build output:"
         ls -lh target/${{ matrix.rust_target }}/release/
         file target/${{ matrix.rust_target }}/release/trafficmon
+        
+        # 清理編譯中間檔案
+        cargo clean --target ${{ matrix.rust_target }} --release
+        rm -rf target/${{ matrix.rust_target }}/release/{build,deps,examples,incremental}
+        
+        echo "=== Disk space after Rust build ==="
+        df -h / | tail -1
 
     - name: Strip binary using OpenWrt toolchain
       run: |
@@ -302,11 +356,34 @@ jobs:
       run: |
         cd sdk
         make defconfig
+        
+        echo "=== Disk space after defconfig ==="
+        df -h / | tail -1
 
     - name: Build OpenWrt package
       run: |
         cd sdk
-        make package/trafficmon/compile V=s J=$(nproc)
+        
+        echo "=== Disk space before build ==="
+        df -h / | tail -1
+        
+        # 使用所有 CPU 核心加速編譯
+        JOBS=$(nproc)
+        echo "Building with $JOBS parallel jobs"
+        
+        make package/trafficmon/compile V=s -j$JOBS || make package/trafficmon/compile V=s -j1
+        
+        echo "=== Disk space after build ==="
+        df -h / | tail -1
+        
+        # 清理編譯中間檔案
+        echo "=== Cleaning build artifacts ==="
+        make clean || true
+        rm -rf build_dir/target-*/root-* 2>/dev/null || true
+        rm -rf staging_dir/target-*/root-* 2>/dev/null || true
+        
+        echo "=== Final disk space ==="
+        df -h / | tail -1
 
     - name: Find and organize IPK files
       run: |
