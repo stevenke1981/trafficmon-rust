@@ -78,49 +78,39 @@ jobs:
         {
           "arch": "aarch64",
           "data-layout": "e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128",
-          "disable-redzone": true,
-          "executables": true,
-          "features": "+neon,+fp-armv8",
-          "is-like-linux": true,
-          "linker": "aarch64-openwrt-linux-musl-gcc",
-          "linker-flavor": "gcc",
           "llvm-target": "aarch64-unknown-linux-musl",
-          "max-atomic-width": 128,
-          "dynamic-linking": false,
-          "executables": true,
-          "panic-strategy": "unwind",
-          "position-independent-executables": false,
-          "relro-level": "full",
-          "relocation-model": "static",
-          "target-family": "unix",
+          "target-endian": "little",
           "target-pointer-width": 64,
           "target-c-int-width": "32",
-          "target-endian": "little",
-          "target-os": "linux",
-          "target-env": "musl",
-          "target-vendor": "unknown",
+          "os": "linux",
+          "env": "musl",
+          "vendor": "unknown",
+          "linker": "aarch64-openwrt-linux-musl-gcc",
+          "linker-flavor": "gcc",
+          "cpu": "cortex-a53",
+          "features": "+neon,+fp-armv8",
+          "dynamic-linking": false,
+          "executables": true,
+          "position-independent-executables": false,
+          "relocation-model": "static",
           "code-model": "small",
-          "static-position-independent-executables": true,
-          "supports-function-sections": true,
-          "supports-robust-stack-probing": true,
-          "supports-stack-protector": true
+          "panic-strategy": "unwind",
+          "relro-level": "full",
+          "disable-redzone": true,
+          "target-family": "unix"
         }
         EOF
         
         # 驗證 JSON 格式
-        python3 -m json.tool aarch64_cortex-a53.json > /dev/null && echo "JSON format is valid"
+        python3 -c "import json; json.load(open('aarch64_cortex-a53.json')); print('JSON format is valid')"
 
     - name: Build Rust Package
       run: |
         export STAGING_DIR="${{ env.STAGING_DIR }}"
         export PATH="$STAGING_DIR/toolchain-${{ env.TARGET }}_gcc-13.3.0_musl/bin:$PATH"
         
-        # 首先測試基本的 Rust 編譯
-        echo 'fn main() { println!("test"); }' > simple_test.rs
-        rustc --target aarch64_cortex-a53.json simple_test.rs || true
-        
         # 使用更簡單的 RUSTFLAGS
-        export RUSTFLAGS="-C linker=aarch64-openwrt-linux-musl-gcc"
+        export RUSTFLAGS="-C linker=aarch64-openwrt-linux-musl-gcc -C link-arg=-static"
         
         # 嘗試建置
         cargo build --target aarch64_cortex-a53.json --release --verbose
@@ -131,11 +121,15 @@ jobs:
         mkdir -p openwrt-package/usr/bin
         mkdir -p openwrt-package/CONTROL
         
-        # 複製二進位檔案 (請將 your-binary-name 替換為實際的二進位文件名稱)
+        # 複製二進位檔案
         BINARY_NAME=$(find target/aarch64_cortex-a53.json/release -maxdepth 1 -type f -executable | head -1)
         if [ -n "$BINARY_NAME" ]; then
           cp "$BINARY_NAME" openwrt-package/usr/bin/
           chmod +x openwrt-package/usr/bin/$(basename "$BINARY_NAME")
+          echo "Binary copied: $(basename "$BINARY_NAME")"
+        else
+          echo "No binary found, listing directory:"
+          find target/aarch64_cortex-a53.json/release -type f || true
         fi
         
         # 建立控制檔案
