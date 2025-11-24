@@ -1,16 +1,14 @@
-# .cargo/config.toml
-# Rust 交叉編譯設定
+[build]
+target-dir = "target"
 
-[target.x86_64-unknown-linux-musl]
-linker = "gcc"
+[target.aarch64_cortex-a53]
+linker = "aarch64-openwrt-linux-musl-gcc"
+ar = "aarch64-openwrt-linux-musl-ar"
+rustflags = [
+  "-C", "link-arg=-static",
+  "-C", "target-feature=+crt-static"
+]
 
-[target.aarch64-unknown-linux-musl]
-linker = "aarch64-linux-gnu-gcc"
-
-# 編譯優化設定 (針對 OpenWrt 路由器)
-[profile.release]
-opt-level = "z"        # 優化檔案大小
-lto = true             # Link Time Optimization
-codegen-units = 1      # 更好的優化
-strip = true           # 自動移除除錯符號
-panic = "abort"        # 減少 binary 大小
+[env]
+STAGING_DIR = { value = "./openwrt-sdk/staging_dir", relative = true }
+SDK_PATH = { value = "./openwrt-sdk", relative = true }

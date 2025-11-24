@@ -1,0 +1,16 @@
+# .cargo/config.toml
+# Rust 交叉編譯設定
+
+[target.x86_64-unknown-linux-musl]
+linker = "gcc"
+
+[target.aarch64-unknown-linux-musl]
+linker = "aarch64-linux-gnu-gcc"
+
+# 編譯優化設定 (針對 OpenWrt 路由器)
+[profile.release]
+opt-level = "z"        # 優化檔案大小
+lto = true             # Link Time Optimization
+codegen-units = 1      # 更好的優化
+strip = true           # 自動移除除錯符號
+panic = "abort"        # 減少 binary 大小
