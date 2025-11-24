@@ -1,0 +1,380 @@
+name: Build OpenWrt Package
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-x86_64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    name: Build for x86_64
+    container:
+      image: openwrt/sdk:x86_64-24.10.0
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Rust in container
+      run: |
+        # 在容器內安裝 Rust
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+        source $HOME/.cargo/env
+        rustup target add x86_64-unknown-linux-musl
+
+    - name: Build Rust binary
+      env:
+        CARGO_TARGET_DIR: /github/workspace/target-x86_64
+        CARGO_INCREMENTAL: 0
+        RUSTFLAGS: "-C target-feature=+crt-static"
+      run: |
+        source $HOME/.cargo/env
+        echo "Building Rust binary..."
+        cargo build --release --target x86_64-unknown-linux-musl --jobs $(nproc)
+        
+        echo "Build output:"
+        ls -lh target-x86_64/x86_64-unknown-linux-musl/release/trafficmon
+        file target-x86_64/x86_64-unknown-linux-musl/release/trafficmon
+
+    - name: Create OpenWrt package structure
+      run: |
+        mkdir -p package/trafficmon/files
+        
+        # 複製編譯好的二進位檔案
+        cp target-x86_64/x86_64-unknown-linux-musl/release/trafficmon package/trafficmon/files/
+        chmod +x package/trafficmon/files/trafficmon
+        
+        # 建立 Makefile
+        cat > package/trafficmon/Makefile << 'EOF'
+        include $(TOPDIR)/rules.mk
+        
+        PKG_NAME:=trafficmon
+        PKG_VERSION:=1.0.0
+        PKG_RELEASE:=1
+        
+        PKG_LICENSE:=MIT
+        PKG_MAINTAINER:=Steven Ke <stevenke1981@gmail.com>
+        
+        include $(INCLUDE_DIR)/package.mk
+        
+        define Package/trafficmon
+          SECTION:=net
+          CATEGORY:=Network
+          TITLE:=Network traffic monitor using nftables
+          DEPENDS:=+nftables +kmod-nft-core
+          URL:=https://github.com/stevenke1981/trafficmon-rust
+        endef
+        
+        define Package/trafficmon/description
+          Monitor network traffic on specified interfaces using nftables counters.
+          Outputs statistics to JSON format for easy integration.
+        endef
+        
+        define Package/trafficmon/conffiles
+        /etc/config/trafficmon
+        endef
+        
+        define Build/Prepare
+        	mkdir -p $(PKG_BUILD_DIR)
+        endef
+        
+        define Build/Compile
+        	# Binary already compiled by Rust
+        endef
+        
+        define Package/trafficmon/install
+        	$(INSTALL_DIR) $(1)/usr/bin
+        	$(INSTALL_BIN) ./files/trafficmon $(1)/usr/bin/
+        	
+        	$(INSTALL_DIR) $(1)/etc/init.d
+        	$(INSTALL_BIN) ./files/trafficmon.init $(1)/etc/init.d/trafficmon
+        	
+        	$(INSTALL_DIR) $(1)/etc/config
+        	$(INSTALL_CONF) ./files/trafficmon.config $(1)/etc/config/trafficmon
+        endef
+        
+        $(eval $(call BuildPackage,trafficmon))
+        EOF
+        
+        # 建立 init 腳本
+        cat > package/trafficmon/files/trafficmon.init << 'EOF'
+        #!/bin/sh /etc/rc.common
+        
+        START=99
+        STOP=10
+        
+        USE_PROCD=1
+        PROG=/usr/bin/trafficmon
+        
+        start_service() {
+            local enabled
+            local interfaces
+            local interval
+            local output_path
+            
+            config_load 'trafficmon'
+            config_get_bool enabled 'config' 'enabled' 0
+            config_get interfaces 'config' 'interfaces' 'eth1 wan'
+            config_get interval 'config' 'interval' '5'
+            config_get output_path 'config' 'output_path' '/var/run/trafficmon.json'
+            
+            [ "$enabled" -eq 0 ] && {
+                logger -t trafficmon "trafficmon is disabled in config"
+                return 1
+            }
+            
+            procd_open_instance
+            procd_set_param command $PROG
+            procd_set_param env TRAFFICMON_INTERFACES="$interfaces"
+            procd_set_param env TRAFFICMON_INTERVAL="$interval"
+            procd_set_param env TRAFFICMON_OUTPUT="$output_path"
+            procd_set_param respawn 3600 5 5
+            procd_set_param stdout 1
+            procd_set_param stderr 1
+            procd_close_instance
+            
+            logger -t trafficmon "trafficmon started monitoring: $interfaces"
+        }
+        
+        stop_service() {
+            logger -t trafficmon "Stopping trafficmon"
+        }
+        
+        service_triggers() {
+            procd_add_reload_trigger "trafficmon"
+        }
+        
+        reload_service() {
+            stop
+            start
+        }
+        EOF
+        
+        # 建立 config 檔
+        cat > package/trafficmon/files/trafficmon.config << 'EOF'
+        config trafficmon 'config'
+        	option enabled '1'
+        	option interfaces 'eth1 wan'
+        	option interval '5'
+        	option output_path '/var/run/trafficmon.json'
+        EOF
+        
+        chmod +x package/trafficmon/files/trafficmon.init
+
+    - name: Build OpenWrt package
+      run: |
+        echo "=== Building trafficmon package ==="
+        make package/trafficmon/compile V=s
+        
+        echo "Creating package index..."
+        make package/index
+
+    - name: Collect IPK files
+      run: |
+        mkdir -p /github/workspace/ipk-x86_64
+        find bin -name "trafficmon*.ipk" -exec cp {} /github/workspace/ipk-x86_64/ \;
+        echo "=== Generated IPK files ==="
+        ls -lh /github/workspace/ipk-x86_64/
+
+    - name: Upload IPK package
+      uses: actions/upload-artifact@v4
+      with:
+        name: trafficmon-x86_64-ipk
+        path: ipk-x86_64/*.ipk
+        if-no-files-found: error
+
+  build-aarch64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    name: Build for aarch64_cortex-a53
+    container:
+      image: openwrt/sdk:mediatek_filogic-24.10.0
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Rust in container
+      run: |
+        # 在容器內安裝 Rust
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+        source $HOME/.cargo/env
+        rustup target add aarch64-unknown-linux-musl
+
+    - name: Build Rust binary
+      env:
+        CARGO_TARGET_DIR: /github/workspace/target-aarch64
+        CARGO_INCREMENTAL: 0
+        RUSTFLAGS: "-C target-feature=+crt-static"
+      run: |
+        source $HOME/.cargo/env
+        echo "Building Rust binary..."
+        cargo build --release --target aarch64-unknown-linux-musl --jobs $(nproc)
+        
+        echo "Build output:"
+        ls -lh target-aarch64/aarch64-unknown-linux-musl/release/trafficmon
+        file target-aarch64/aarch64-unknown-linux-musl/release/trafficmon
+
+    - name: Create OpenWrt package structure
+      run: |
+        mkdir -p package/trafficmon/files
+        
+        # 複製編譯好的二進位檔案
+        cp target-aarch64/aarch64-unknown-linux-musl/release/trafficmon package/trafficmon/files/
+        chmod +x package/trafficmon/files/trafficmon
+        
+        # 建立 Makefile（與 x86_64 相同）
+        cat > package/trafficmon/Makefile << 'EOF'
+        include $(TOPDIR)/rules.mk
+        
+        PKG_NAME:=trafficmon
+        PKG_VERSION:=1.0.0
+        PKG_RELEASE:=1
+        
+        PKG_LICENSE:=MIT
+        PKG_MAINTAINER:=Steven Ke <stevenke1981@gmail.com>
+        
+        include $(INCLUDE_DIR)/package.mk
+        
+        define Package/trafficmon
+          SECTION:=net
+          CATEGORY:=Network
+          TITLE:=Network traffic monitor using nftables
+          DEPENDS:=+nftables +kmod-nft-core
+          URL:=https://github.com/stevenke1981/trafficmon-rust
+        endef
+        
+        define Package/trafficmon/description
+          Monitor network traffic on specified interfaces using nftables counters.
+          Outputs statistics to JSON format for easy integration.
+        endef
+        
+        define Package/trafficmon/conffiles
+        /etc/config/trafficmon
+        endef
+        
+        define Build/Prepare
+        	mkdir -p $(PKG_BUILD_DIR)
+        endef
+        
+        define Build/Compile
+        	# Binary already compiled by Rust
+        endef
+        
+        define Package/trafficmon/install
+        	$(INSTALL_DIR) $(1)/usr/bin
+        	$(INSTALL_BIN) ./files/trafficmon $(1)/usr/bin/
+        	
+        	$(INSTALL_DIR) $(1)/etc/init.d
+        	$(INSTALL_BIN) ./files/trafficmon.init $(1)/etc/init.d/trafficmon
+        	
+        	$(INSTALL_DIR) $(1)/etc/config
+        	$(INSTALL_CONF) ./files/trafficmon.config $(1)/etc/config/trafficmon
+        endef
+        
+        $(eval $(call BuildPackage,trafficmon))
+        EOF
+        
+        # 建立 init 腳本和 config 檔案（與 x86_64 相同）
+        cat > package/trafficmon/files/trafficmon.init << 'EOF'
+        #!/bin/sh /etc/rc.common
+        START=99
+        STOP=10
+        USE_PROCD=1
+        PROG=/usr/bin/trafficmon
+        
+        start_service() {
+            local enabled interfaces interval output_path
+            config_load 'trafficmon'
+            config_get_bool enabled 'config' 'enabled' 0
+            config_get interfaces 'config' 'interfaces' 'eth1 wan'
+            config_get interval 'config' 'interval' '5'
+            config_get output_path 'config' 'output_path' '/var/run/trafficmon.json'
+            
+            [ "$enabled" -eq 0 ] && return 1
+            
+            procd_open_instance
+            procd_set_param command $PROG
+            procd_set_param env TRAFFICMON_INTERFACES="$interfaces"
+            procd_set_param env TRAFFICMON_INTERVAL="$interval"
+            procd_set_param env TRAFFICMON_OUTPUT="$output_path"
+            procd_set_param respawn 3600 5 5
+            procd_set_param stdout 1
+            procd_set_param stderr 1
+            procd_close_instance
+        }
+        
+        stop_service() {
+            logger -t trafficmon "Stopping trafficmon"
+        }
+        
+        service_triggers() {
+            procd_add_reload_trigger "trafficmon"
+        }
+        
+        reload_service() {
+            stop
+            start
+        }
+        EOF
+        
+        cat > package/trafficmon/files/trafficmon.config << 'EOF'
+        config trafficmon 'config'
+        	option enabled '1'
+        	option interfaces 'eth1 wan'
+        	option interval '5'
+        	option output_path '/var/run/trafficmon.json'
+        EOF
+        
+        chmod +x package/trafficmon/files/trafficmon.init
+
+    - name: Build OpenWrt package
+      run: |
+        echo "=== Building trafficmon package ==="
+        make package/trafficmon/compile V=s
+        
+        echo "Creating package index..."
+        make package/index
+
+    - name: Collect IPK files
+      run: |
+        mkdir -p /github/workspace/ipk-aarch64
+        find bin -name "trafficmon*.ipk" -exec cp {} /github/workspace/ipk-aarch64/ \;
+        echo "=== Generated IPK files ==="
+        ls -lh /github/workspace/ipk-aarch64/
+
+    - name: Upload IPK package
+      uses: actions/upload-artifact@v4
+      with:
+        name: trafficmon-aarch64-ipk
+        path: ipk-aarch64/*.ipk
+        if-no-files-found: error
+
+  create-release:
+    needs: [build-x86_64, build-aarch64]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    timeout-minutes: 5
+    
+    steps:
+    - name: Download artifacts
+      uses: actions/download-artifact@v4
+      
+    - name: Create release bundle
+      run: |
+        mkdir -p release
+        # 合併所有 IPK 檔案
+        find . -name "*.ipk" -exec cp {} release/ \;
+        echo "Release contents:"
+        ls -la release/
+
+    - name: Upload release
+      uses: actions/upload-artifact@v4
+      with:
+        name: trafficmon-openwrt-packages
+        path: release/*
+        retention-days: 90
