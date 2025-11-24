@@ -21,9 +21,16 @@ jobs:
       run: |
         # 使用 Docker 運行 OpenWrt SDK 進行編譯
         docker run --rm -v "$(pwd):/build" -w /build \
-          openwrt/sdk:x86_64-24.10.0 \
+          --user root openwrt/sdk:x86_64-24.10.0 \
           /bin/bash -c "
             set -e  # 遇到錯誤立即退出
+            
+            # 更改工作目錄到可寫入的位置
+            cd /tmp
+            
+            # 複製原始碼
+            cp -r /build/. /tmp/src
+            cd /tmp/src
             
             # 安裝 Rust（使用非互動模式）
             export CARGO_HOME=/tmp/cargo
@@ -37,9 +44,12 @@ jobs:
             # 編譯 Rust 二進位檔案
             cargo build --release --target x86_64-unknown-linux-musl --jobs \$(nproc)
             
+            # 回到 OpenWrt SDK 目錄
+            cd /build
+            
             # 創建 OpenWrt 包結構
             mkdir -p package/trafficmon/files
-            cp target/x86_64-unknown-linux-musl/release/trafficmon package/trafficmon/files/
+            cp /tmp/src/target/x86_64-unknown-linux-musl/release/trafficmon package/trafficmon/files/
             chmod +x package/trafficmon/files/trafficmon
             
             # 創建 Makefile
@@ -175,11 +185,18 @@ jobs:
 
     - name: Build using OpenWrt SDK Docker
       run: |
-        # 使用 Docker 運行 OpenWrt SDK 進行編譯
+        # 使用正確的鏡像名稱
         docker run --rm -v "$(pwd):/build" -w /build \
-          openwrt/sdk:mediatek_filogic-24.10.0 \
+          --user root openwrt/sdk:armvirt-64-24.10.0 \
           /bin/bash -c "
             set -e  # 遇到錯誤立即退出
+            
+            # 更改工作目錄到可寫入的位置
+            cd /tmp
+            
+            # 複製原始碼
+            cp -r /build/. /tmp/src
+            cd /tmp/src
             
             # 安裝 Rust（使用非互動模式）
             export CARGO_HOME=/tmp/cargo
@@ -193,9 +210,12 @@ jobs:
             # 編譯 Rust 二進位檔案
             cargo build --release --target aarch64-unknown-linux-musl --jobs \$(nproc)
             
+            # 回到 OpenWrt SDK 目錄
+            cd /build
+            
             # 創建 OpenWrt 包結構
             mkdir -p package/trafficmon/files
-            cp target/aarch64-unknown-linux-musl/release/trafficmon package/trafficmon/files/
+            cp /tmp/src/target/aarch64-unknown-linux-musl/release/trafficmon package/trafficmon/files/
             chmod +x package/trafficmon/files/trafficmon
             
             # 使用相同的 Makefile 和配置檔案
