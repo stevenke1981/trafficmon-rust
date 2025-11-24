@@ -1,0 +1,1226 @@
+name: Build OpenWrt Package
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+env:
+  OPENWRT_VERSION: "24.10.0"
+  MIRROR_URL: "https://mirror-03.infra.openwrt.org/releases/24.10.0/targets"
+
+jobs:
+  build-x86_64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    name: Build for x86_64
+    env:
+      ARCH: "x86_64"
+      TARGET: "x86/64"
+      SDK_NAME: "openwrt-sdk-24.10.0-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst"
+      RUST_TARGET: "x86_64-unknown-linux-musl"
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Free disk space
+      run: |
+        echo "=== Before cleanup ==="
+        df -h
+        
+        echo "=== Removing unnecessary packages ==="
+        sudo apt-get remove -y '^aspnetcore-.*' '^dotnet-.*' '^llvm-.*' 'php.*' '^mongodb-.*' '^mysql-.*' azure-cli google-chrome-stable firefox powershell mono-devel libgl1-mesa-dri || true
+        sudo apt-get autoremove -y
+        sudo apt-get clean
+        
+        echo "=== Removing large directories ==="
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /usr/local/lib/android
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /opt/hostedtoolcache/CodeQL
+        sudo rm -rf /usr/local/share/boost
+        sudo rm -rf /usr/share/swift
+        sudo rm -rf /usr/local/.ghcup
+        sudo rm -rf /usr/local/share/chromium
+        sudo rm -rf /usr/local/lib/node_modules
+        sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+        
+        echo "=== Cleaning docker ==="
+        docker rmi $(docker images -q) || true
+        
+        echo "=== After cleanup ==="
+        df -h
+        echo "=== Available space in root ==="
+        df -h / | tail -1 | awk '{print "Available: " $4}'
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          ccache \
+          clang \
+          ecj \
+          fastjar \
+          file \
+          g++ \
+          gawk \
+          gettext \
+          git \
+          java-propose-classpath \
+          libelf-dev \
+          libncurses5-dev \
+          libncursesw5-dev \
+          libssl-dev \
+          python3 \
+          python3-setuptools \
+          python3-dev \
+          rsync \
+          subversion \
+          swig \
+          unzip \
+          wget \
+          xsltproc \
+          zlib1g-dev \
+          zstd
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ env.RUST_TARGET }}
+
+    - name: Cache Rust
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ env.RUST_TARGET }}-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache OpenWrt SDK
+      id: cache-sdk-x86
+      uses: actions/cache@v4
+      with:
+        path: sdk-x86_64
+        key: openwrt-sdk-${{ env.ARCH }}-${{ env.SDK_NAME }}-${{ hashFiles('.github/workflows/build-ipk.yml') }}
+        restore-keys: |
+          openwrt-sdk-${{ env.ARCH }}-${{ env.SDK_NAME }}-
+
+    - name: Download and extract OpenWrt SDK
+      if: steps.cache-sdk-x86.outputs.cache-hit != 'true'
+      run: |
+        SDK_URL="${{ env.MIRROR_URL }}/${{ env.TARGET }}/${{ env.SDK_NAME }}"
+        echo "Downloading SDK from: $SDK_URL"
+        wget -q --show-progress "$SDK_URL"
+        
+        echo "Extracting SDK..."
+        tar --zstd -xf "${{ env.SDK_NAME }}"
+        
+        SDK_DIR=$(tar --zstd -tf "${{ env.SDK_NAME }}" | head -1 | cut -f1 -d"/")
+        mv "$SDK_DIR" sdk-x86_64
+        rm "${{ env.SDK_NAME }}"
+        
+        echo "SDK extracted successfully"
+
+    - name: Verify SDK exists
+      run: |
+        if [ ! -d "sdk-x86_64" ]; then
+          echo "Error: SDK directory not found"
+          exit 1
+        fi
+        echo "SDK directory found:"
+        ls -la sdk-x86_64/ | head -20
+        
+        echo "=== Disk space after SDK ==="
+        df -h / | tail -1
+
+    - name: Update SDK feeds
+      if: steps.cache-sdk-x86.outputs.cache-hit != 'true'
+      run: |
+        cd sdk-x86_64
+        
+        # 移除 luci feed (如果存在)
+        if [ -f feeds.conf.default ]; then
+          sed -i '/luci/d' feeds.conf.default
+          echo "Updated feeds.conf.default:"
+          cat feeds.conf.default
+        fi
+        
+        # 更新 feeds (限制時間)
+        timeout 300 ./scripts/feeds update -a || echo "Feed update timed out, continuing..."
+        timeout 300 ./scripts/feeds install -a || echo "Feed install timed out, continuing..."
+    
+    - name: Clean SDK if cached
+      if: steps.cache-sdk-x86.outputs.cache-hit == 'true'
+      run: |
+        cd sdk-x86_64
+        echo "Cleaning cached SDK..."
+        make clean || true
+        rm -rf build_dir/target-* staging_dir/target-* tmp/ .config.old || true
+        echo "SDK cleaned"
+
+    - name: Build Rust binary
+      env:
+        CARGO_TARGET_DIR: ${{ github.workspace }}/target-x86_64
+        CARGO_INCREMENTAL: 0
+        CARGO_NET_RETRY: 10
+      run: |
+        echo "Building for target: ${{ env.RUST_TARGET }}"
+        cargo build --release --target ${{ env.RUST_TARGET }}
+        
+        # 檢查編譯結果
+        echo "Build output:"
+        ls -lh target-x86_64/${{ env.RUST_TARGET }}/release/
+        file target-x86_64/${{ env.RUST_TARGET }}/release/trafficmon
+        
+        # 清理編譯中間檔案
+        cargo clean --target ${{ env.RUST_TARGET }} --release
+        rm -rf target-x86_64/${{ env.RUST_TARGET }}/release/{build,deps,examples,incremental}
+        
+        echo "=== Disk space after Rust build ==="
+        df -h / | tail -1
+
+    - name: Strip binary using OpenWrt toolchain
+      run: |
+        cd sdk-x86_64
+        
+        # 設定 PATH 以使用 OpenWrt toolchain
+        export PATH="$(pwd)/staging_dir/toolchain-*/bin:$PATH"
+        
+        # 找到正確的 strip 工具
+        STRIP_BIN=$(find staging_dir/toolchain-*/bin -name "*-strip" | head -1)
+        
+        if [ -n "$STRIP_BIN" ]; then
+          echo "Using strip: $STRIP_BIN"
+          $STRIP_BIN ../target-x86_64/${{ env.RUST_TARGET }}/release/trafficmon
+          echo "After strip:"
+          ls -lh ../target-x86_64/${{ env.RUST_TARGET }}/release/trafficmon
+        else
+          echo "Warning: strip not found, skipping"
+        fi
+
+    - name: Create package directory structure
+      run: |
+        cd sdk-x86_64
+        mkdir -p package/trafficmon/files
+        
+        # 複製編譯好的 binary
+        cp ../target-x86_64/${{ env.RUST_TARGET }}/release/trafficmon package/trafficmon/files/
+        chmod +x package/trafficmon/files/trafficmon
+        
+        # 建立 Makefile
+        cat > package/trafficmon/Makefile << 'EOF'
+        include $(TOPDIR)/rules.mk
+        
+        PKG_NAME:=trafficmon
+        PKG_VERSION:=1.0.0
+        PKG_RELEASE:=1
+        
+        PKG_LICENSE:=MIT
+        PKG_MAINTAINER:=Steven Ke <stevenke1981@gmail.com>
+        
+        include $(INCLUDE_DIR)/package.mk
+        
+        define Package/trafficmon
+          SECTION:=net
+          CATEGORY:=Network
+          TITLE:=Network traffic monitor using nftables
+          DEPENDS:=+nftables +kmod-nft-core
+          URL:=https://github.com/stevenke1981/trafficmon-rust
+        endef
+        
+        define Package/trafficmon/description
+          Monitor network traffic on specified interfaces using nftables counters.
+          Outputs statistics to JSON format for easy integration.
+        endef
+        
+        define Package/trafficmon/conffiles
+        /etc/config/trafficmon
+        endef
+        
+        define Build/Prepare
+        	mkdir -p $(PKG_BUILD_DIR)
+        endef
+        
+        define Build/Compile
+        	# Binary already compiled by Rust
+        endef
+        
+        define Package/trafficmon/install
+        	$(INSTALL_DIR) $(1)/usr/bin
+        	$(INSTALL_BIN) ./files/trafficmon $(1)/usr/bin/
+        	
+        	$(INSTALL_DIR) $(1)/etc/init.d
+        	$(INSTALL_BIN) ./files/trafficmon.init $(1)/etc/init.d/trafficmon
+        	
+        	$(INSTALL_DIR) $(1)/etc/config
+        	$(INSTALL_CONF) ./files/trafficmon.config $(1)/etc/config/trafficmon
+        endef
+        
+        $(eval $(call BuildPackage,trafficmon))
+        EOF
+        
+        # 建立 init 腳本
+        cat > package/trafficmon/files/trafficmon.init << 'EOF'
+        #!/bin/sh /etc/rc.common
+        
+        START=99
+        STOP=10
+        
+        USE_PROCD=1
+        PROG=/usr/bin/trafficmon
+        
+        start_service() {
+            local enabled
+            local interfaces
+            local interval
+            local output_path
+            
+            config_load 'trafficmon'
+            config_get_bool enabled 'config' 'enabled' 0
+            config_get interfaces 'config' 'interfaces' 'eth1 wan'
+            config_get interval 'config' 'interval' '5'
+            config_get output_path 'config' 'output_path' '/var/run/trafficmon.json'
+            
+            [ "$enabled" -eq 0 ] && {
+                logger -t trafficmon "trafficmon is disabled in config"
+                return 1
+            }
+            
+            setup_nftables "$interfaces"
+            
+            procd_open_instance
+            procd_set_param command $PROG
+            procd_set_param env TRAFFICMON_INTERFACES="$interfaces"
+            procd_set_param env TRAFFICMON_INTERVAL="$interval"
+            procd_set_param env TRAFFICMON_OUTPUT="$output_path"
+            procd_set_param respawn 3600 5 5
+            procd_set_param stdout 1
+            procd_set_param stderr 1
+            procd_close_instance
+            
+            logger -t trafficmon "trafficmon started monitoring: $interfaces"
+        }
+        
+        setup_nftables() {
+            local interfaces="$1"
+            
+            nft list table inet trafficmon >/dev/null 2>&1 || {
+                logger -t trafficmon "Setting up nftables table and counters"
+                
+                nft add table inet trafficmon
+                
+                for iface in $interfaces; do
+                    nft add counter inet trafficmon "cnt_${iface}"
+                done
+                
+                nft add chain inet trafficmon forward { type filter hook forward priority 0\; }
+                
+                for iface in $interfaces; do
+                    nft add rule inet trafficmon forward iifname "$iface" counter name "cnt_${iface}"
+                    nft add rule inet trafficmon forward oifname "$iface" counter name "cnt_${iface}"
+                done
+                
+                logger -t trafficmon "nftables setup completed"
+            }
+        }
+        
+        stop_service() {
+            logger -t trafficmon "Stopping trafficmon"
+        }
+        
+        service_triggers() {
+            procd_add_reload_trigger "trafficmon"
+        }
+        
+        reload_service() {
+            stop
+            start
+        }
+        EOF
+        
+        # 建立 config 檔
+        cat > package/trafficmon/files/trafficmon.config << 'EOF'
+        config trafficmon 'config'
+        	option enabled '1'
+        	option interfaces 'eth1 wan'
+        	option interval '5'
+        	option output_path '/var/run/trafficmon.json'
+        EOF
+        
+        chmod +x package/trafficmon/files/trafficmon.init
+
+    - name: Configure SDK
+      run: |
+        cd sdk-x86_64
+        
+        # 確保清理舊的設定
+        rm -f .config .config.old
+        
+        # 創建最小化配置，跳過內核模塊編譯
+        cat > .config << 'EOF'
+        CONFIG_ALL_KMODS=n
+        CONFIG_ALL_NONSHARED=n
+        CONFIG_AUTOREMOVE=y
+        CONFIG_BUILD_LOG=y
+        CONFIG_CCACHE=y
+        CONFIG_JSON_OVERVIEW=y
+        CONFIG_SDK=y
+        CONFIG_USE_MUSL=y
+        # 禁用有問題的內核模塊
+        CONFIG_PACKAGE_gpio-button-hotplug=n
+        CONFIG_PACKAGE_kmod-gpio-button-hotplug=n
+        CONFIG_PACKAGE_kmod-button-hotplug=n
+        # 啟用我們需要的包
+        CONFIG_PACKAGE_nftables=y
+        CONFIG_PACKAGE_kmod-nft-core=y
+        CONFIG_PACKAGE_libnftnl=y
+        CONFIG_PACKAGE_libmnl=y
+        EOF
+        
+        # 應用配置
+        make defconfig
+        
+        echo "=== Current config ==="
+        grep "CONFIG_PACKAGE" .config | head -20
+        
+        echo "=== Disk space after defconfig ==="
+        df -h / | tail -1
+
+    - name: Build OpenWrt package
+      run: |
+        cd sdk-x86_64
+        
+        echo "=== Disk space before build ==="
+        df -h / | tail -1
+        
+        # 使用所有 CPU 核心加速編譯，跳過錯誤
+        JOBS=$(nproc)
+        echo "Building with $JOBS parallel jobs"
+        
+        # 先嘗試單線程編譯，如果失敗則嘗試忽略錯誤
+        make package/trafficmon/compile V=s -j1 || make package/trafficmon/compile V=s IGNORE_ERRORS=m -j1
+        
+        echo "=== Disk space after build ==="
+        df -h / | tail -1
+        
+        # 清理編譯中間檔案
+        echo "=== Cleaning build artifacts ==="
+        make clean || true
+        rm -rf build_dir/target-*/root-* 2>/dev/null || true
+        rm -rf staging_dir/target-*/root-* 2>/dev/null || true
+        
+        echo "=== Final disk space ==="
+        df -h / | tail -1
+
+    - name: Find and organize IPK files
+      run: |
+        cd sdk-x86_64
+        mkdir -p ../ipk-x86_64
+        
+        # 尋找並複製 IPK 檔案
+        find bin/packages -name "trafficmon*.ipk" -exec cp -v {} ../ipk-x86_64/ \;
+        
+        # 如果沒有找到 IPK，嘗試手動創建
+        if [ ! -f ../ipk-x86_64/trafficmon*.ipk ]; then
+          echo "No IPK found, creating manually..."
+          ../create_ipk_manual.sh x86_64
+        fi
+        
+        # 顯示結果
+        echo "=== Generated IPK files ==="
+        ls -lh ../ipk-x86_64/
+        
+        # 顯示 IPK 內容
+        for ipk in ../ipk-x86_64/trafficmon*.ipk; do
+          if [ -f "$ipk" ]; then
+            echo ""
+            echo "=== Contents of $(basename $ipk) ==="
+            tar -tzf "$ipk" | head -30
+          fi
+        done
+
+    - name: Create manual IPK script (備用)
+      if: always()
+      run: |
+        cat > create_ipk_manual.sh << 'EOF'
+        #!/bin/bash
+        set -e
+        
+        ARCH=$1
+        PKG_NAME="trafficmon"
+        PKG_VERSION="1.0.0"
+        
+        IPK_DIR="ipk-manual-${ARCH}"
+        mkdir -p ${IPK_DIR}/CONTROL
+        mkdir -p ${IPK_DIR}/usr/bin
+        mkdir -p ${IPK_DIR}/etc/init.d
+        mkdir -p ${IPK_DIR}/etc/config
+        
+        # 複製文件
+        cp target-${ARCH}/$2/release/trafficmon ${IPK_DIR}/usr/bin/
+        cp sdk-${ARCH}/package/trafficmon/files/trafficmon.init ${IPK_DIR}/etc/init.d/trafficmon
+        cp sdk-${ARCH}/package/trafficmon/files/trafficmon.config ${IPK_DIR}/etc/config/trafficmon
+        
+        chmod +x ${IPK_DIR}/usr/bin/trafficmon
+        chmod +x ${IPK_DIR}/etc/init.d/trafficmon
+        
+        # 創建 control 文件
+        cat > ${IPK_DIR}/CONTROL/control << EOC
+        Package: ${PKG_NAME}
+        Version: ${PKG_VERSION}
+        Depends: nftables, kmod-nft-core
+        Source: https://github.com/stevenke1981/trafficmon-rust
+        Section: net
+        Architecture: ${ARCH}
+        Installed-Size: $(du -sk ${IPK_DIR} | cut -f1)
+        Maintainer: Steven Ke <stevenke1981@gmail.com>
+        Description: Network traffic monitor using nftables
+         Monitor network traffic on specified interfaces using nftables counters.
+         Outputs statistics to JSON format for easy integration.
+        EOC
+        
+        # 創建 postinst 腳本
+        cat > ${IPK_DIR}/CONTROL/postinst << 'EOS'
+        #!/bin/sh
+        [ -n "${IPKG_INSTROOT}" ] && exit 0
+        /etc/init.d/trafficmon enable >/dev/null 2>&1 || true
+        exit 0
+        EOS
+        
+        chmod +x ${IPK_DIR}/CONTROL/postinst
+        
+        # 打包 IPK
+        cd ${IPK_DIR}
+        tar -czf ../data.tar.gz . --owner=0 --group=0
+        cd ../CONTROL
+        tar -czf ../control.tar.gz . --owner=0 --group=0
+        cd ..
+        
+        echo "2.0" > debian-binary
+        tar -czf ../ipk-${ARCH}/trafficmon_${PKG_VERSION}_${ARCH}.ipk ./debian-binary ./control.tar.gz ./data.tar.gz
+        cd ..
+        
+        echo "Manual IPK created successfully"
+        EOF
+        
+        chmod +x create_ipk_manual.sh
+
+    - name: Upload IPK package
+      uses: actions/upload-artifact@v4
+      with:
+        name: trafficmon-x86_64-ipk
+        path: ipk-x86_64/*.ipk
+        if-no-files-found: error
+
+    - name: Create build info
+      run: |
+        cat > build-info-x86_64.txt << EOF
+        trafficmon Build Information
+        ============================
+        
+        Architecture: x86_64
+        OpenWrt Version: ${{ env.OPENWRT_VERSION }}
+        Target: ${{ env.TARGET }}
+        Rust Target: ${{ env.RUST_TARGET }}
+        GCC Version: 13.3.0
+        
+        Build Information:
+        - Date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+        - Commit: ${{ github.sha }}
+        - Branch: ${{ github.ref_name }}
+        - Workflow: ${{ github.workflow }}
+        
+        Installation:
+        1. scp trafficmon_*.ipk root@router:/tmp/
+        2. ssh root@router
+        3. opkg install /tmp/trafficmon_*.ipk
+        4. vi /etc/config/trafficmon
+        5. /etc/init.d/trafficmon enable
+        6. /etc/init.d/trafficmon start
+        
+        Usage:
+        - Config: /etc/config/trafficmon
+        - Output: /var/run/trafficmon.json
+        - Logs: logread | grep trafficmon
+        EOF
+        
+        cat build-info-x86_64.txt
+        
+    - name: Upload build info
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-info-x86_64
+        path: build-info-x86_64.txt
+
+  build-aarch64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    name: Build for aarch64_cortex-a53
+    env:
+      ARCH: "aarch64_cortex-a53"
+      TARGET: "mediatek/filogic"
+      SDK_NAME: "openwrt-sdk-24.10.0-mediatek-filogic_gcc-13.3.0_musl.Linux-x86_64.tar.zst"
+      RUST_TARGET: "aarch64-unknown-linux-musl"
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Free disk space
+      run: |
+        echo "=== Before cleanup ==="
+        df -h
+        
+        echo "=== Removing unnecessary packages ==="
+        sudo apt-get remove -y '^aspnetcore-.*' '^dotnet-.*' '^llvm-.*' 'php.*' '^mongodb-.*' '^mysql-.*' azure-cli google-chrome-stable firefox powershell mono-devel libgl1-mesa-dri || true
+        sudo apt-get autoremove -y
+        sudo apt-get clean
+        
+        echo "=== Removing large directories ==="
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /usr/local/lib/android
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /opt/hostedtoolcache/CodeQL
+        sudo rm -rf /usr/local/share/boost
+        sudo rm -rf /usr/share/swift
+        sudo rm -rf /usr/local/.ghcup
+        sudo rm -rf /usr/local/share/chromium
+        sudo rm -rf /usr/local/lib/node_modules
+        sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+        
+        echo "=== Cleaning docker ==="
+        docker rmi $(docker images -q) || true
+        
+        echo "=== After cleanup ==="
+        df -h
+        echo "=== Available space in root ==="
+        df -h / | tail -1 | awk '{print "Available: " $4}'
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          ccache \
+          clang \
+          ecj \
+          fastjar \
+          file \
+          g++ \
+          gawk \
+          gettext \
+          git \
+          java-propose-classpath \
+          libelf-dev \
+          libncurses5-dev \
+          libncursesw5-dev \
+          libssl-dev \
+          python3 \
+          python3-setuptools \
+          python3-dev \
+          rsync \
+          subversion \
+          swig \
+          unzip \
+          wget \
+          xsltproc \
+          zlib1g-dev \
+          zstd
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ env.RUST_TARGET }}
+
+    - name: Cache Rust
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ env.RUST_TARGET }}-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache OpenWrt SDK
+      id: cache-sdk-aarch64
+      uses: actions/cache@v4
+      with:
+        path: sdk-aarch64
+        key: openwrt-sdk-${{ env.ARCH }}-${{ env.SDK_NAME }}-${{ hashFiles('.github/workflows/build-ipk.yml') }}
+        restore-keys: |
+          openwrt-sdk-${{ env.ARCH }}-${{ env.SDK_NAME }}-
+
+    - name: Download and extract OpenWrt SDK
+      if: steps.cache-sdk-aarch64.outputs.cache-hit != 'true'
+      run: |
+        SDK_URL="${{ env.MIRROR_URL }}/${{ env.TARGET }}/${{ env.SDK_NAME }}"
+        echo "Downloading SDK from: $SDK_URL"
+        wget -q --show-progress "$SDK_URL"
+        
+        echo "Extracting SDK..."
+        tar --zstd -xf "${{ env.SDK_NAME }}"
+        
+        SDK_DIR=$(tar --zstd -tf "${{ env.SDK_NAME }}" | head -1 | cut -f1 -d"/")
+        mv "$SDK_DIR" sdk-aarch64
+        rm "${{ env.SDK_NAME }}"
+        
+        echo "SDK extracted successfully"
+
+    - name: Verify SDK exists
+      run: |
+        if [ ! -d "sdk-aarch64" ]; then
+          echo "Error: SDK directory not found"
+          exit 1
+        fi
+        echo "SDK directory found:"
+        ls -la sdk-aarch64/ | head -20
+        
+        echo "=== Disk space after SDK ==="
+        df -h / | tail -1
+
+    - name: Update SDK feeds
+      if: steps.cache-sdk-aarch64.outputs.cache-hit != 'true'
+      run: |
+        cd sdk-aarch64
+        
+        # 移除 luci feed (如果存在)
+        if [ -f feeds.conf.default ]; then
+          sed -i '/luci/d' feeds.conf.default
+          echo "Updated feeds.conf.default:"
+          cat feeds.conf.default
+        fi
+        
+        # 更新 feeds (限制時間)
+        timeout 300 ./scripts/feeds update -a || echo "Feed update timed out, continuing..."
+        timeout 300 ./scripts/feeds install -a || echo "Feed install timed out, continuing..."
+    
+    - name: Clean SDK if cached
+      if: steps.cache-sdk-aarch64.outputs.cache-hit == 'true'
+      run: |
+        cd sdk-aarch64
+        echo "Cleaning cached SDK..."
+        make clean || true
+        rm -rf build_dir/target-* staging_dir/target-* tmp/ .config.old || true
+        echo "SDK cleaned"
+
+    - name: Build Rust binary
+      env:
+        CARGO_TARGET_DIR: ${{ github.workspace }}/target-aarch64
+        CARGO_INCREMENTAL: 0
+        CARGO_NET_RETRY: 10
+      run: |
+        echo "Building for target: ${{ env.RUST_TARGET }}"
+        cargo build --release --target ${{ env.RUST_TARGET }}
+        
+        # 檢查編譯結果
+        echo "Build output:"
+        ls -lh target-aarch64/${{ env.RUST_TARGET }}/release/
+        file target-aarch64/${{ env.RUST_TARGET }}/release/trafficmon
+        
+        # 清理編譯中間檔案
+        cargo clean --target ${{ env.RUST_TARGET }} --release
+        rm -rf target-aarch64/${{ env.RUST_TARGET }}/release/{build,deps,examples,incremental}
+        
+        echo "=== Disk space after Rust build ==="
+        df -h / | tail -1
+
+    - name: Strip binary using OpenWrt toolchain
+      run: |
+        cd sdk-aarch64
+        
+        # 設定 PATH 以使用 OpenWrt toolchain
+        export PATH="$(pwd)/staging_dir/toolchain-*/bin:$PATH"
+        
+        # 找到正確的 strip 工具
+        STRIP_BIN=$(find staging_dir/toolchain-*/bin -name "*-strip" | head -1)
+        
+        if [ -n "$STRIP_BIN" ]; then
+          echo "Using strip: $STRIP_BIN"
+          $STRIP_BIN ../target-aarch64/${{ env.RUST_TARGET }}/release/trafficmon
+          echo "After strip:"
+          ls -lh ../target-aarch64/${{ env.RUST_TARGET }}/release/trafficmon
+        else
+          echo "Warning: strip not found, skipping"
+        fi
+
+    - name: Create package directory structure
+      run: |
+        cd sdk-aarch64
+        mkdir -p package/trafficmon/files
+        
+        # 複製編譯好的 binary
+        cp ../target-aarch64/${{ env.RUST_TARGET }}/release/trafficmon package/trafficmon/files/
+        chmod +x package/trafficmon/files/trafficmon
+        
+        # 建立 Makefile (與 x86_64 相同)
+        cat > package/trafficmon/Makefile << 'EOF'
+        include $(TOPDIR)/rules.mk
+        
+        PKG_NAME:=trafficmon
+        PKG_VERSION:=1.0.0
+        PKG_RELEASE:=1
+        
+        PKG_LICENSE:=MIT
+        PKG_MAINTAINER:=Steven Ke <stevenke1981@gmail.com>
+        
+        include $(INCLUDE_DIR)/package.mk
+        
+        define Package/trafficmon
+          SECTION:=net
+          CATEGORY:=Network
+          TITLE:=Network traffic monitor using nftables
+          DEPENDS:=+nftables +kmod-nft-core
+          URL:=https://github.com/stevenke1981/trafficmon-rust
+        endef
+        
+        define Package/trafficmon/description
+          Monitor network traffic on specified interfaces using nftables counters.
+          Outputs statistics to JSON format for easy integration.
+        endef
+        
+        define Package/trafficmon/conffiles
+        /etc/config/trafficmon
+        endef
+        
+        define Build/Prepare
+        	mkdir -p $(PKG_BUILD_DIR)
+        endef
+        
+        define Build/Compile
+        	# Binary already compiled by Rust
+        endef
+        
+        define Package/trafficmon/install
+        	$(INSTALL_DIR) $(1)/usr/bin
+        	$(INSTALL_BIN) ./files/trafficmon $(1)/usr/bin/
+        	
+        	$(INSTALL_DIR) $(1)/etc/init.d
+        	$(INSTALL_BIN) ./files/trafficmon.init $(1)/etc/init.d/trafficmon
+        	
+        	$(INSTALL_DIR) $(1)/etc/config
+        	$(INSTALL_CONF) ./files/trafficmon.config $(1)/etc/config/trafficmon
+        endef
+        
+        $(eval $(call BuildPackage,trafficmon))
+        EOF
+        
+        # 建立 init 腳本 (與 x86_64 相同)
+        cat > package/trafficmon/files/trafficmon.init << 'EOF'
+        #!/bin/sh /etc/rc.common
+        
+        START=99
+        STOP=10
+        
+        USE_PROCD=1
+        PROG=/usr/bin/trafficmon
+        
+        start_service() {
+            local enabled
+            local interfaces
+            local interval
+            local output_path
+            
+            config_load 'trafficmon'
+            config_get_bool enabled 'config' 'enabled' 0
+            config_get interfaces 'config' 'interfaces' 'eth1 wan'
+            config_get interval 'config' 'interval' '5'
+            config_get output_path 'config' 'output_path' '/var/run/trafficmon.json'
+            
+            [ "$enabled" -eq 0 ] && {
+                logger -t trafficmon "trafficmon is disabled in config"
+                return 1
+            }
+            
+            setup_nftables "$interfaces"
+            
+            procd_open_instance
+            procd_set_param command $PROG
+            procd_set_param env TRAFFICMON_INTERFACES="$interfaces"
+            procd_set_param env TRAFFICMON_INTERVAL="$interval"
+            procd_set_param env TRAFFICMON_OUTPUT="$output_path"
+            procd_set_param respawn 3600 5 5
+            procd_set_param stdout 1
+            procd_set_param stderr 1
+            procd_close_instance
+            
+            logger -t trafficmon "trafficmon started monitoring: $interfaces"
+        }
+        
+        setup_nftables() {
+            local interfaces="$1"
+            
+            nft list table inet trafficmon >/dev/null 2>&1 || {
+                logger -t trafficmon "Setting up nftables table and counters"
+                
+                nft add table inet trafficmon
+                
+                for iface in $interfaces; do
+                    nft add counter inet trafficmon "cnt_${iface}"
+                done
+                
+                nft add chain inet trafficmon forward { type filter hook forward priority 0\; }
+                
+                for iface in $interfaces; do
+                    nft add rule inet trafficmon forward iifname "$iface" counter name "cnt_${iface}"
+                    nft add rule inet trafficmon forward oifname "$iface" counter name "cnt_${iface}"
+                done
+                
+                logger -t trafficmon "nftables setup completed"
+            }
+        }
+        
+        stop_service() {
+            logger -t trafficmon "Stopping trafficmon"
+        }
+        
+        service_triggers() {
+            procd_add_reload_trigger "trafficmon"
+        }
+        
+        reload_service() {
+            stop
+            start
+        }
+        EOF
+        
+        # 建立 config 檔 (與 x86_64 相同)
+        cat > package/trafficmon/files/trafficmon.config << 'EOF'
+        config trafficmon 'config'
+        	option enabled '1'
+        	option interfaces 'eth1 wan'
+        	option interval '5'
+        	option output_path '/var/run/trafficmon.json'
+        EOF
+        
+        chmod +x package/trafficmon/files/trafficmon.init
+
+    - name: Configure SDK
+      run: |
+        cd sdk-aarch64
+        
+        # 確保清理舊的設定
+        rm -f .config .config.old
+        
+        # 創建最小化配置，跳過內核模塊編譯
+        cat > .config << 'EOF'
+        CONFIG_ALL_KMODS=n
+        CONFIG_ALL_NONSHARED=n
+        CONFIG_AUTOREMOVE=y
+        CONFIG_BUILD_LOG=y
+        CONFIG_CCACHE=y
+        CONFIG_JSON_OVERVIEW=y
+        CONFIG_SDK=y
+        CONFIG_USE_MUSL=y
+        # 禁用有問題的內核模塊
+        CONFIG_PACKAGE_gpio-button-hotplug=n
+        CONFIG_PACKAGE_kmod-gpio-button-hotplug=n
+        CONFIG_PACKAGE_kmod-button-hotplug=n
+        # 啟用我們需要的包
+        CONFIG_PACKAGE_nftables=y
+        CONFIG_PACKAGE_kmod-nft-core=y
+        CONFIG_PACKAGE_libnftnl=y
+        CONFIG_PACKAGE_libmnl=y
+        EOF
+        
+        # 應用配置
+        make defconfig
+        
+        echo "=== Current config ==="
+        grep "CONFIG_PACKAGE" .config | head -20
+        
+        echo "=== Disk space after defconfig ==="
+        df -h / | tail -1
+
+    - name: Build OpenWrt package
+      run: |
+        cd sdk-aarch64
+        
+        echo "=== Disk space before build ==="
+        df -h / | tail -1
+        
+        # 使用所有 CPU 核心加速編譯，跳過錯誤
+        JOBS=$(nproc)
+        echo "Building with $JOBS parallel jobs"
+        
+        # 先嘗試單線程編譯，如果失敗則嘗試忽略錯誤
+        make package/trafficmon/compile V=s -j1 || make package/trafficmon/compile V=s IGNORE_ERRORS=m -j1
+        
+        echo "=== Disk space after build ==="
+        df -h / | tail -1
+        
+        # 清理編譯中間檔案
+        echo "=== Cleaning build artifacts ==="
+        make clean || true
+        rm -rf build_dir/target-*/root-* 2>/dev/null || true
+        rm -rf staging_dir/target-*/root-* 2>/dev/null || true
+        
+        echo "=== Final disk space ==="
+        df -h / | tail -1
+
+    - name: Find and organize IPK files
+      run: |
+        cd sdk-aarch64
+        mkdir -p ../ipk-aarch64
+        
+        # 尋找並複製 IPK 檔案
+        find bin/packages -name "trafficmon*.ipk" -exec cp -v {} ../ipk-aarch64/ \;
+        
+        # 如果沒有找到 IPK，嘗試手動創建
+        if [ ! -f ../ipk-aarch64/trafficmon*.ipk ]; then
+          echo "No IPK found, creating manually..."
+          ../create_ipk_manual.sh aarch64_cortex-a53 ${{ env.RUST_TARGET }}
+        fi
+        
+        # 顯示結果
+        echo "=== Generated IPK files ==="
+        ls -lh ../ipk-aarch64/
+        
+        # 顯示 IPK 內容
+        for ipk in ../ipk-aarch64/trafficmon*.ipk; do
+          if [ -f "$ipk" ]; then
+            echo ""
+            echo "=== Contents of $(basename $ipk) ==="
+            tar -tzf "$ipk" | head -30
+          fi
+        done
+
+    - name: Create manual IPK script (備用)
+      if: always()
+      run: |
+        cat > create_ipk_manual.sh << 'EOF'
+        #!/bin/bash
+        set -e
+        
+        ARCH=$1
+        RUST_TARGET=$2
+        PKG_NAME="trafficmon"
+        PKG_VERSION="1.0.0"
+        
+        IPK_DIR="ipk-manual-${ARCH}"
+        mkdir -p ${IPK_DIR}/CONTROL
+        mkdir -p ${IPK_DIR}/usr/bin
+        mkdir -p ${IPK_DIR}/etc/init.d
+        mkdir -p ${IPK_DIR}/etc/config
+        
+        # 複製文件
+        cp target-${ARCH}/${RUST_TARGET}/release/trafficmon ${IPK_DIR}/usr/bin/
+        cp sdk-${ARCH}/package/trafficmon/files/trafficmon.init ${IPK_DIR}/etc/init.d/trafficmon
+        cp sdk-${ARCH}/package/trafficmon/files/trafficmon.config ${IPK_DIR}/etc/config/trafficmon
+        
+        chmod +x ${IPK_DIR}/usr/bin/trafficmon
+        chmod +x ${IPK_DIR}/etc/init.d/trafficmon
+        
+        # 創建 control 文件
+        cat > ${IPK_DIR}/CONTROL/control << EOC
+        Package: ${PKG_NAME}
+        Version: ${PKG_VERSION}
+        Depends: nftables, kmod-nft-core
+        Source: https://github.com/stevenke1981/trafficmon-rust
+        Section: net
+        Architecture: ${ARCH}
+        Installed-Size: $(du -sk ${IPK_DIR} | cut -f1)
+        Maintainer: Steven Ke <stevenke1981@gmail.com>
+        Description: Network traffic monitor using nftables
+         Monitor network traffic on specified interfaces using nftables counters.
+         Outputs statistics to JSON format for easy integration.
+        EOC
+        
+        # 創建 postinst 腳本
+        cat > ${IPK_DIR}/CONTROL/postinst << 'EOS'
+        #!/bin/sh
+        [ -n "${IPKG_INSTROOT}" ] && exit 0
+        /etc/init.d/trafficmon enable >/dev/null 2>&1 || true
+        exit 0
+        EOS
+        
+        chmod +x ${IPK_DIR}/CONTROL/postinst
+        
+        # 打包 IPK
+        cd ${IPK_DIR}
+        tar -czf ../data.tar.gz . --owner=0 --group=0
+        cd ../CONTROL
+        tar -czf ../control.tar.gz . --owner=0 --group=0
+        cd ..
+        
+        echo "2.0" > debian-binary
+        tar -czf ../ipk-${ARCH}/trafficmon_${PKG_VERSION}_${ARCH}.ipk ./debian-binary ./control.tar.gz ./data.tar.gz
+        cd ..
+        
+        echo "Manual IPK created successfully"
+        EOF
+        
+        chmod +x create_ipk_manual.sh
+
+    - name: Upload IPK package
+      uses: actions/upload-artifact@v4
+      with:
+        name: trafficmon-aarch64-ipk
+        path: ipk-aarch64/*.ipk
+        if-no-files-found: error
+
+    - name: Create build info
+      run: |
+        cat > build-info-aarch64.txt << EOF
+        trafficmon Build Information
+        ============================
+        
+        Architecture: aarch64_cortex-a53
+        OpenWrt Version: ${{ env.OPENWRT_VERSION }}
+        Target: ${{ env.TARGET }}
+        Rust Target: ${{ env.RUST_TARGET }}
+        GCC Version: 13.3.0
+        
+        Build Information:
+        - Date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+        - Commit: ${{ github.sha }}
+        - Branch: ${{ github.ref_name }}
+        - Workflow: ${{ github.workflow }}
+        
+        Installation:
+        1. scp trafficmon_*.ipk root@router:/tmp/
+        2. ssh root@router
+        3. opkg install /tmp/trafficmon_*.ipk
+        4. vi /etc/config/trafficmon
+        5. /etc/init.d/trafficmon enable
+        6. /etc/init.d/trafficmon start
+        
+        Usage:
+        - Config: /etc/config/trafficmon
+        - Output: /var/run/trafficmon.json
+        - Logs: logread | grep trafficmon
+        EOF
+        
+        cat build-info-aarch64.txt
+        
+    - name: Upload build info
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-info-aarch64
+        path: build-info-aarch64.txt
+
+  create-release:
+    needs: [build-x86_64, build-aarch64]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      
+    - name: Display structure
+      run: |
+        echo "=== Downloaded artifacts ==="
+        ls -R
+      
+    - name: Create release archives
+      run: |
+        mkdir -p release
+        
+        # 處理 x86_64 IPK
+        if [ -d "trafficmon-x86_64-ipk" ]; then
+          echo "Creating archive for x86_64"
+          tar czf release/trafficmon-openwrt24.10-x86_64.tar.gz -C trafficmon-x86_64-ipk .
+        fi
+        
+        # 處理 aarch64 IPK
+        if [ -d "trafficmon-aarch64-ipk" ]; then
+          echo "Creating archive for aarch64"
+          tar czf release/trafficmon-openwrt24.10-aarch64_cortex-a53.tar.gz -C trafficmon-aarch64-ipk .
+        fi
+        
+        # 複製 build info
+        cp build-info-x86_64/build-info-x86_64.txt release/
+        cp build-info-aarch64/build-info-aarch64.txt release/
+        
+        echo ""
+        echo "=== Release files ==="
+        ls -lh release/
+        
+    - name: Upload release archives
+      uses: actions/upload-artifact@v4
+      with:
+        name: trafficmon-openwrt-24.10-all
+        path: release/*
+
+    - name: Generate release summary
+      run: |
+        cat > release/README.txt << 'EOF'
+        trafficmon - OpenWrt 24.10.0 Packages
+        ======================================
+        
+        Supported Architectures:
+        - x86_64: x86 PCs, virtual machines
+        - aarch64_cortex-a53: MediaTek Filogic (MT798x) routers
+        
+        Installation Instructions:
+        ==========================
+        
+        1. Download the IPK for your architecture
+        
+        2. Copy to your OpenWrt router:
+           scp trafficmon_*.ipk root@192.168.1.1:/tmp/
+        
+        3. SSH into your router:
+           ssh root@192.168.1.1
+        
+        4. Install the package:
+           opkg install /tmp/trafficmon_*.ipk
+        
+        5. Configure (optional):
+           vi /etc/config/trafficmon
+           
+           Available options:
+           - enabled: 0/1 (disable/enable)
+           - interfaces: space-separated list (e.g., 'eth1 wan')
+           - interval: update interval in seconds
+           - output_path: JSON output file path
+        
+        6. Enable and start service:
+           /etc/init.d/trafficmon enable
+           /etc/init.d/trafficmon start
+        
+        7. Check status:
+           cat /var/run/trafficmon.json
+           logread | grep trafficmon
+        
+        Monitoring:
+        ===========
+        
+        View real-time data:
+           watch -n 1 cat /var/run/trafficmon.json
+        
+        Check nftables counters:
+           nft list table inet trafficmon
+           nft list counter inet trafficmon cnt_eth1
+        
+        Restart service:
+           /etc/init.d/trafficmon restart
+        
+        Stop service:
+           /etc/init.d/trafficmon stop
+        
+        Troubleshooting:
+        ================
+        
+        Check if service is running:
+           ps | grep trafficmon
+        
+        View logs:
+           logread | grep trafficmon
+        
+        Test nftables manually:
+           nft list ruleset | grep trafficmon
+        
+        Uninstall:
+           opkg remove trafficmon
+        
+        For issues and source code:
+        https://github.com/stevenke1981/trafficmon-rust
+        EOF
+        
+        cat release/README.txt
