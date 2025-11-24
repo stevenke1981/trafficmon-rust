@@ -1,0 +1,165 @@
+name: Clean Disk Space
+
+on:
+  workflow_dispatch:
+    inputs:
+      cleanup_level:
+        description: 'Cleanup level'
+        required: true
+        default: 'standard'
+        type: choice
+        options:
+        - minimal
+        - standard
+        - aggressive
+
+jobs:
+  cleanup:
+    name: Clean Disk Space
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check current disk space
+        run: |
+          echo "=== Current Disk Usage ==="
+          df -h
+          echo ""
+          echo "=== Largest directories in / ==="
+          sudo du -h --max-depth=1 / 2>/dev/null | sort -hr | head -20 || true
+
+      - name: Minimal cleanup
+        if: inputs.cleanup_level == 'minimal'
+        run: |
+          echo "Performing minimal cleanup..."
+          sudo apt-get autoremove -y
+          sudo apt-get clean
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+
+      - name: Standard cleanup
+        if: inputs.cleanup_level == 'standard'
+        run: |
+          echo "Performing standard cleanup..."
+          
+          # Remove unnecessary packages
+          sudo apt-get remove -y '^aspnetcore-.*' '^dotnet-.*' '^llvm-.*' 'php.*' '^mongodb-.*' '^mysql-.*' \
+            azure-cli google-chrome-stable firefox powershell mono-devel libgl1-mesa-dri || true
+          sudo apt-get autoremove -y
+          sudo apt-get clean
+          
+          # Remove large directories
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf /usr/local/.ghcup
+          sudo rm -rf /usr/local/share/chromium
+          sudo rm -rf /usr/local/lib/node_modules
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          
+          # Clean Docker
+          docker system prune -f || true
+          
+          # Clean temporary files
+          sudo rm -rf /tmp/* /var/tmp/*
+
+      - name: Aggressive cleanup
+        if: inputs.cleanup_level == 'aggressive'
+        run: |
+          echo "Performing aggressive cleanup..."
+          
+          # Remove all unnecessary packages
+          sudo apt-get remove -y '^aspnetcore-.*' '^dotnet-.*' '^llvm-.*' '^php.*' '^mongodb-.*' '^mysql-.*' \
+            '^postgresql-.*' '^ruby-.*' '^r-.*' azure-cli google-chrome-stable firefox powershell mono-devel \
+            libgl1-mesa-dri ansible terraform || true
+          sudo apt-get autoremove -y --purge
+          sudo apt-get clean
+          
+          # Remove all large directories
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf /usr/local/.ghcup
+          sudo rm -rf /usr/local/share/chromium
+          sudo rm -rf /usr/local/lib/node_modules
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo rm -rf /usr/local/aws-cli
+          sudo rm -rf /usr/local/lib/heroku
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /imagegeneration
+          sudo rm -rf /opt/microsoft
+          sudo rm -rf /usr/share/miniconda
+          sudo rm -rf /usr/share/gradle-*
+          sudo rm -rf /usr/share/apache-maven-*
+          sudo rm -rf /usr/share/sbt
+          sudo rm -rf /usr/share/oracle-java*
+          sudo rm -rf /usr/share/rust
+          sudo rm -rf /usr/share/go-*
+          
+          # Aggressive Docker cleanup
+          docker system prune -a -f --volumes || true
+          
+          # Clean all temporary and cache files
+          sudo rm -rf /tmp/* /var/tmp/*
+          sudo rm -rf /var/cache/apt/*
+          sudo rm -rf /var/lib/apt/lists/*
+          sudo rm -rf /root/.cache
+          sudo rm -rf /home/runner/.cache
+          
+          # Clean log files
+          sudo find /var/log -type f -name "*.log" -exec truncate -s 0 {} \; 2>/dev/null || true
+          sudo journalctl --vacuum-time=1d || true
+
+      - name: Show cleanup results
+        run: |
+          echo "=== After Cleanup Disk Usage ==="
+          df -h
+          echo ""
+          echo "=== Available space ==="
+          AVAILABLE=$(df -h / | tail -1 | awk '{print $4}')
+          echo "Available space: $AVAILABLE"
+          echo "::notice title=Cleanup Complete::Available space: $AVAILABLE"
+
+      - name: Create cleanup report
+        run: |
+          BEFORE_SPACE=${{ fromJSON('["10G","20G","30G"]')[github.event.inputs.cleanup_level == 'minimal' && 0 || (github.event.inputs.cleanup_level == 'standard' && 1 || 2)] }}
+          echo "Cleanup Level: ${{ github.event.inputs.cleanup_level }}" > cleanup-report.txt
+          echo "Estimated Space Freed: $BEFORE_SPACE" >> cleanup-report.txt
+          echo "Timestamp: $(date -u)" >> cleanup-report.txt
+          echo "" >> cleanup-report.txt
+          echo "Cleaned items:" >> cleanup-report.txt
+          
+          if [ "${{ github.event.inputs.cleanup_level }}" = "minimal" ]; then
+            echo "- .NET SDK" >> cleanup-report.txt
+            echo "- Android SDK" >> cleanup-report.txt
+            echo "- CodeQL cache" >> cleanup-report.txt
+            echo "- APT cache" >> cleanup-report.txt
+          elif [ "${{ github.event.inputs.cleanup_level }}" = "standard" ]; then
+            echo "- .NET SDK" >> cleanup-report.txt
+            echo "- Android SDK" >> cleanup-report.txt
+            echo "- CodeQL cache" >> cleanup-report.txt
+            echo "- GHC compiler" >> cleanup-report.txt
+            echo "- Boost libraries" >> cleanup-report.txt
+            echo "- Swift toolchain" >> cleanup-report.txt
+            echo "- Chromium browser" >> cleanup-report.txt
+            echo "- Node.js modules" >> cleanup-report.txt
+            echo "- Docker images" >> cleanup-report.txt
+            echo "- Unnecessary packages" >> cleanup-report.txt
+          else
+            echo "- ALL development toolchains" >> cleanup-report.txt
+            echo "- ALL SDKs and runtimes" >> cleanup-report.txt
+            echo "- ALL Docker images and volumes" >> cleanup-report.txt
+            echo "- ALL cache and temporary files" >> cleanup-report.txt
+            echo "- ALL unnecessary system packages" >> cleanup-report.txt
+          fi
+
+      - name: Upload cleanup report
+        uses: actions/upload-artifact@v4
+        with:
+          name: disk-cleanup-report
+          path: cleanup-report.txt
