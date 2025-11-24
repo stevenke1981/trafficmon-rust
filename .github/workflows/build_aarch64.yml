@@ -9,146 +9,101 @@ on:
     types: [ published ]
 
 env:
-  CARGO_NET_GIT_FETCH_WITH_CLI: true
-  RUST_BACKTRACE: full
   TARGET: aarch64_cortex-a53
   OPENWRT_ARCH: aarch64_cortex-a53
   TOOLCHAIN_TRIPLE: aarch64-openwrt-linux-musl
+  SDK_URL: https://downloads.openwrt.org/releases/24.10.0/targets/mediatek/filogic/openwrt-sdk-24.10.0-mediatek_filogic_gcc-13.3.0_musl.Linux-x86_64.tar.xz
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout code
+    - name: Checkout Code
       uses: actions/checkout@v4
 
-    - name: Install System Dependencies
+    - name: Install Build Dependencies
       run: |
-        sudo apt-get update
-        sudo apt-get install -y \
-          build-essential \
-          libncurses5-dev \
-          libssl-dev \
-          python3 \
-          python3-pip \
-          unzip \
-          wget \
-          file \
-          tar \
-          zstd \
-          gcc-aarch64-linux-gnu \
-          g++-aarch64-linux-gnu
+        sudo apt update
+        sudo apt install -y build-essential clang llvm libc6-dev-i386 unzip xz-utils gcc-aarch64-linux-gnu
 
-    - name: Install Rust Toolchain
-      uses: actions-rust-lang/setup-rust-toolchain@v1
-      with:
-        toolchain: stable
-        targets: aarch64-unknown-linux-musl
-        components: rust-src
-
-    - name: Download OpenWrt SDK for Filogic
+    - name: Download OpenWrt SDK
       run: |
-        SDK_URL="https://archive.openwrt.org/releases/24.10.0/targets/mediatek/filogic/openwrt-sdk-24.10.0-mediatek-filogic_gcc-13.3.0_musl.Linux-x86_64.tar.zst"
-        wget -O sdk.tar.zst "$SDK_URL"
-        unzstd sdk.tar.zst || tar --use-compress-program=unzstd -xf sdk.tar.zst
-        tar -xf sdk.tar
+        wget -O sdk.tar.xz $SDK_URL
+        tar -xf sdk.tar.xz
         mv openwrt-sdk-* openwrt-sdk
-        echo "SDK_PATH=$(pwd)/openwrt-sdk" >> $GITHUB_ENV
-        echo "STAGING_DIR=$(pwd)/openwrt-sdk/staging_dir" >> $GITHUB_ENV
 
-    - name: Setup Cross-Compile Environment
+    - name: Set ENV Paths
       run: |
-        export STAGING_DIR="${{ env.STAGING_DIR }}"
-        export PATH="$STAGING_DIR/toolchain-${{ env.TARGET }}_gcc-13.3.0_musl/bin:$PATH"
-        
-        # 驗證工具鏈
-        aarch64-openwrt-linux-musl-gcc --version
-        aarch64-linux-gnu-gcc --version
-        
-        # 設定編譯環境變數
-        echo "CARGO_TARGET_AARCH64_CORTEX_A53_LINKER=aarch64-openwrt-linux-musl-gcc" >> $GITHUB_ENV
-        echo "CC_aarch64_cortex-a53=aarch64-openwrt-linux-musl-gcc" >> $GITHUB_ENV
-        echo "CXX_aarch64_cortex-a53=aarch64-openwrt-linux-musl-g++" >> $GITHUB_ENV
-        echo "AR_aarch64_cortex-a53=aarch64-openwrt-linux-musl-ar" >> $GITHUB_ENV
+        echo "STAGING_DIR=$GITHUB_WORKSPACE/openwrt-sdk/staging_dir" >> $GITHUB_ENV
+        echo "PATH=$GITHUB_WORKSPACE/openwrt-sdk/staging_dir/toolchain-aarch64_generic_gcc-13.3.0_musl/bin:$PATH" >> $GITHUB_ENV
 
-    - name: Create Correct Target Specification
+    - name: Verify Toolchain
       run: |
-        cat > aarch64_cortex-a53.json << 'EOF'
-        {
-          "arch": "aarch64",
-          "data-layout": "e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128",
-          "llvm-target": "aarch64-unknown-linux-musl",
-          "target-endian": "little",
-          "target-pointer-width": 64,
-          "target-c-int-width": "32",
-          "os": "linux",
-          "env": "musl",
-          "vendor": "unknown",
-          "linker": "aarch64-openwrt-linux-musl-gcc",
-          "linker-flavor": "gcc",
-          "cpu": "cortex-a53",
-          "features": "+neon,+fp-armv8",
-          "dynamic-linking": false,
-          "executables": true,
-          "position-independent-executables": false,
-          "relocation-model": "static",
-          "code-model": "small",
-          "panic-strategy": "unwind",
-          "relro-level": "full",
-          "disable-redzone": true,
-          "target-family": "unix"
-        }
-        EOF
-        
-        # 驗證 JSON 格式
-        python3 -c "import json; json.load(open('aarch64_cortex-a53.json')); print('JSON format is valid')"
+        $TOOLCHAIN_TRIPLE-gcc -v
 
-    - name: Build Rust Package
-      run: |
-        export STAGING_DIR="${{ env.STAGING_DIR }}"
-        export PATH="$STAGING_DIR/toolchain-${{ env.TARGET }}_gcc-13.3.0_musl/bin:$PATH"
-        
-        # 使用更簡單的 RUSTFLAGS
-        export RUSTFLAGS="-C linker=aarch64-openwrt-linux-musl-gcc -C link-arg=-static"
-        
-        # 嘗試建置
-        cargo build --target aarch64_cortex-a53.json --release --verbose
+    - name: Install Rust stable & target
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ env.TARGET }}
 
-    - name: Create OpenWrt Package Structure
+    - name: Generate Correct Rust Target JSON
       run: |
-        # 建立 OpenWrt 套件目錄結構
+        cat > aarch64_cortex-a53.json <<EOF
+{
+  "llvm-target": "aarch64-unknown-linux-musl",
+  "arch": "aarch64",
+  "data-layout": "e-m:o-i64:64-i128:128-n32:64-S128",
+  "target-pointer-width": "64",
+  "target-endian": "little",
+  "os": "linux",
+  "env": "musl",
+  "vendor": "openwrt",
+  "linker": "${{ env.TOOLCHAIN_TRIPLE }}-gcc",
+  "panic-strategy": "abort",
+  "executables": true,
+  "linker-flavor": "gcc",
+  "cpu": "cortex-a53",
+  "features": "+fp-armv8,+neon"
+}
+EOF
+
+    - name: Build Release Binary
+      run: |
+        cargo build --release \
+          --target $(pwd)/aarch64_cortex-a53.json \
+          -Z unstable-options
+
+    - name: Prepare OpenWrt Package Directory
+      run: |
         mkdir -p openwrt-package/usr/bin
-        mkdir -p openwrt-package/CONTROL
-        
-        # 複製二進位檔案
-        BINARY_NAME=$(find target/aarch64_cortex-a53.json/release -maxdepth 1 -type f -executable | head -1)
-        if [ -n "$BINARY_NAME" ]; then
-          cp "$BINARY_NAME" openwrt-package/usr/bin/
-          chmod +x openwrt-package/usr/bin/$(basename "$BINARY_NAME")
-          echo "Binary copied: $(basename "$BINARY_NAME")"
-        else
-          echo "No binary found, listing directory:"
-          find target/aarch64_cortex-a53.json/release -type f || true
-        fi
-        
-        # 建立控制檔案
-        cat > openwrt-package/CONTROL/control << EOF
-        Package: your-rust-package
-        Version: 1.0.0-$(date +%Y%m%d)
-        Depends: libc
-        Source: your-repo
-        Section: utils
-        Architecture: ${{ env.OPENWRT_ARCH }}
-        Installed-Size: $(stat -c%s "$BINARY_NAME" 2>/dev/null || echo 0)
-        Description: Your Rust application for MT7981/MT7986 (Cortex-A53)
-        EOF
+        cp target/aarch64_cortex-a53/release/* openwrt-package/usr/bin/
+
+        cat > openwrt-package/CONTROL/control <<EOF
+Package: trafficmon-rust
+Version: 1.0
+Depends:
+Section: utils
+Architecture: ${{ env.OPENWRT_ARCH }}
+Description: Rust traffic monitor for MT7981/MT7986 Cortex-A53
+EOF
+
+    - name: Build IPK
+      run: |
+        mkdir ipk
+        tar -czf ipk/data.tar.gz -C openwrt-package/ .
+        echo "2.0" > ipk/debian-binary
+        tar -czf ipk/control.tar.gz -C openwrt-package/CONTROL .
+
+        mkdir -p bin
+        ar r bin/trafficmon-rust_${{ env.OPENWRT_ARCH }}.ipk \
+          ipk/debian-binary ipk/control.tar.gz ipk/data.tar.gz
 
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: openwrt-package-cortex-a53
+        name: openwrt-rust-cortex-a53
         path: |
-          openwrt-package/
-          target/aarch64_cortex-a53.json/release/
+          bin/
+          target/aarch64_cortex-a53/release/
         retention-days: 30
