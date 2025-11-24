@@ -69,8 +69,9 @@ jobs:
           python3 \
           python3-setuptools \
           wget \
-          zstd
-        sudo apt-get clean
+          zstd \
+          gcc-aarch64-linux-gnu \
+          g++-aarch64-linux-gnu
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
