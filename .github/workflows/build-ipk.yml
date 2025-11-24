@@ -20,7 +20,7 @@ jobs:
       ARCH: "x86_64"
       TARGET: "x86/64"
       SDK_NAME: "openwrt-sdk-24.10.0-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst"
-      RUST_TARGET: "x86_64-unknown-linux-musl"
+      RUST_TARGET: "x86_64-unknown-linux-gnu"  # 改為 GNU 目標
 
     steps:
     - name: Checkout code
@@ -65,10 +65,7 @@ jobs:
           wget \
           xsltproc \
           zlib1g-dev \
-          zstd \
-          gcc-aarch64-linux-gnu \
-          g++-aarch64-linux-gnu \
-          musl-tools
+          zstd
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
@@ -85,7 +82,7 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-cargo-${{ env.RUST_TARGET }}-
 
-    - name: Build Rust binary with proper musl linking
+    - name: Build Rust binary
       env:
         CARGO_TARGET_DIR: ${{ github.workspace }}/target-x86_64
         CARGO_INCREMENTAL: 0
@@ -94,49 +91,23 @@ jobs:
         
         rustup target add ${{ env.RUST_TARGET }}
         
-        # 方法 1: 使用正確的 musl 靜態連結
-        echo "=== Method 1: Proper musl static linking ==="
-        RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-lm" \
+        # 使用 GNU 目標編譯
         cargo build --release --target ${{ env.RUST_TARGET }} --jobs $(nproc)
         
-        # 檢查是否成功
-        if [ ! -f "target-x86_64/${{ env.RUST_TARGET }}/release/trafficmon" ]; then
-          echo "Method 1 failed, trying method 2..."
-          # 方法 2: 不使用完全靜態，只連結數學庫
-          cargo clean
-          RUSTFLAGS="-C link-arg=-lm" \
-          cargo build --release --target ${{ env.RUST_TARGET }} --jobs $(nproc)
-        fi
-        
-        # 方法 3: 如果上面都失敗，使用 GNU 目標
-        if [ ! -f "target-x86_64/${{ env.RUST_TARGET }}/release/trafficmon" ]; then
-          echo "Method 2 failed, trying GNU target..."
-          cargo clean
-          GNU_TARGET="x86_64-unknown-linux-gnu"
-          rustup target add $GNU_TARGET
-          cargo build --release --target $GNU_TARGET --jobs $(nproc)
-          # 複製到預期位置
-          mkdir -p target-x86_64/${{ env.RUST_TARGET }}/release/
-          cp target-x86_64/$GNU_TARGET/release/trafficmon target-x86_64/${{ env.RUST_TARGET }}/release/
-          echo "Used GNU target as fallback"
-        fi
-        
         echo "Build output:"
-        ls -lh target-x86_64/${{ env.RUST_TARGET }}/release/trafficmon || echo "Binary not found"
+        ls -lh target-x86_64/${{ env.RUST_TARGET }}/release/trafficmon
+        file target-x86_64/${{ env.RUST_TARGET }}/release/trafficmon
         
-        # 檢查二進位檔案類型
-        if [ -f "target-x86_64/${{ env.RUST_TARGET }}/release/trafficmon" ]; then
-          file target-x86_64/${{ env.RUST_TARGET }}/release/trafficmon
-          echo "Binary dependencies:"
-          ldd target-x86_64/${{ env.RUST_TARGET }}/release/trafficmon 2>/dev/null || echo "Static binary or ldd not available"
-        fi
+        # 檢查依賴
+        echo "Binary dependencies:"
+        ldd target-x86_64/${{ env.RUST_TARGET }}/release/trafficmon
 
     - name: Cache OpenWrt SDK
       id: cache-sdk-x86
       uses: actions/cache@v4
       with:
         path: sdk-x86_64
-        key: openwrt-sdk-${{ env.ARCH }}-${{ env.SDK_NAME }}-v7
+        key: openwrt-sdk-${{ env.ARCH }}-${{ env.SDK_NAME }}-v8
         restore-keys: |
           openwrt-sdk-${{ env.ARCH }}-${{ env.SDK_NAME }}-
 
@@ -162,20 +133,11 @@ jobs:
         cd sdk-x86_64
         mkdir -p package/trafficmon/files
         
-        # 檢查並複製二進位檔案
-        if [ -f "../target-x86_64/${{ env.RUST_TARGET }}/release/trafficmon" ]; then
-          cp "../target-x86_64/${{ env.RUST_TARGET }}/release/trafficmon" package/trafficmon/files/
-        elif [ -f "../target/x86_64-unknown-linux-musl/release/trafficmon" ]; then
-          cp "../target/x86_64-unknown-linux-musl/release/trafficmon" package/trafficmon/files/
-        else
-          echo "ERROR: No binary found!"
-          find ../ -name "trafficmon" -type f | head -10
-          exit 1
-        fi
-        
+        # 複製 GNU 編譯的二進位檔案
+        cp "../target-x86_64/${{ env.RUST_TARGET }}/release/trafficmon" package/trafficmon/files/
         chmod +x package/trafficmon/files/trafficmon
         
-        # 建立 Makefile（保持不變）
+        # 建立 Makefile
         cat > package/trafficmon/Makefile << 'EOF'
         include $(TOPDIR)/rules.mk
         
@@ -192,7 +154,7 @@ jobs:
           SECTION:=net
           CATEGORY:=Network
           TITLE:=Network traffic monitor using nftables
-          DEPENDS:=+nftables +kmod-nft-core
+          DEPENDS:=+libgcc +libc +nftables +kmod-nft-core
           URL:=https://github.com/stevenke1981/trafficmon-rust
         endef
         
@@ -309,7 +271,7 @@ jobs:
       ARCH: "aarch64_cortex-a53"
       TARGET: "mediatek/filogic"
       SDK_NAME: "openwrt-sdk-24.10.0-mediatek-filogic_gcc-13.3.0_musl.Linux-x86_64.tar.zst"
-      RUST_TARGET: "aarch64-unknown-linux-musl"
+      RUST_TARGET: "aarch64-unknown-linux-gnu"  # 改為 GNU 目標
 
     steps:
     - name: Checkout code
@@ -346,19 +308,19 @@ jobs:
         echo "Building for target: ${{ env.RUST_TARGET }}"
         rustup target add ${{ env.RUST_TARGET }}
         
-        # 使用與 x86_64 相同的方法
-        RUSTFLAGS="-C link-arg=-lm" \
+        # 使用 GNU 目標編譯
         cargo build --release --target ${{ env.RUST_TARGET }} --jobs $(nproc)
         
         echo "Build output:"
         ls -lh target-aarch64/${{ env.RUST_TARGET }}/release/trafficmon
+        file target-aarch64/${{ env.RUST_TARGET }}/release/trafficmon
 
     - name: Cache OpenWrt SDK
       id: cache-sdk-aarch64
       uses: actions/cache@v4
       with:
         path: sdk-aarch64
-        key: openwrt-sdk-${{ env.ARCH }}-${{ env.SDK_NAME }}-v7
+        key: openwrt-sdk-${{ env.ARCH }}-${{ env.SDK_NAME }}-v8
         restore-keys: |
           openwrt-sdk-${{ env.ARCH }}-${{ env.SDK_NAME }}-
 
@@ -383,7 +345,7 @@ jobs:
       run: |
         cd sdk-aarch64
         mkdir -p package/trafficmon/files
-        cp ../target-aarch64/${{ env.RUST_TARGET }}/release/trafficmon package/trafficmon/files/
+        cp "../target-aarch64/${{ env.RUST_TARGET }}/release/trafficmon" package/trafficmon/files/
         chmod +x package/trafficmon/files/trafficmon
         
         # 複製 Makefile 和配置檔案
