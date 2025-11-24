@@ -20,7 +20,7 @@ jobs:
       ARCH: "x86_64"
       TARGET: "x86/64"
       SDK_NAME: "openwrt-sdk-24.10.0-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst"
-      RUST_TARGET: "x86_64-unknown-linux-gnu"  # 改為 GNU 目標
+      RUST_TARGET: "x86_64-unknown-linux-gnu"
 
     steps:
     - name: Checkout code
@@ -107,7 +107,7 @@ jobs:
       uses: actions/cache@v4
       with:
         path: sdk-x86_64
-        key: openwrt-sdk-${{ env.ARCH }}-${{ env.SDK_NAME }}-v8
+        key: openwrt-sdk-${{ env.ARCH }}-${{ env.SDK_NAME }}-v11
         restore-keys: |
           openwrt-sdk-${{ env.ARCH }}-${{ env.SDK_NAME }}-
 
@@ -116,17 +116,73 @@ jobs:
       run: |
         SDK_URL="${{ env.MIRROR_URL }}/${{ env.TARGET }}/${{ env.SDK_NAME }}"
         echo "Downloading SDK from: $SDK_URL"
+        
+        # 使用 curl 下載
         curl -L --progress-bar -o sdk.tar.zst "$SDK_URL"
-        tar --use-compress-program=unzstd -xf sdk.tar.zst
-        SDK_DIR=$(tar --use-compress-program=unzstd -tf sdk.tar.zst | head -1 | cut -f1 -d"/")
-        mv "$SDK_DIR" sdk-x86_64
-        rm sdk.tar.zst
+        
+        if [ ! -f "sdk.tar.zst" ]; then
+          echo "ERROR: Failed to download SDK"
+          exit 1
+        fi
+        
+        echo "File downloaded, size: $(ls -lh sdk.tar.zst | awk '{print $5}')"
+        
+        echo "Extracting SDK..."
+        # 先解壓 zstd，再解壓 tar
+        zstd -d sdk.tar.zst
+        tar -xf sdk.tar
+        
+        SDK_DIR=$(tar -tf sdk.tar | head -1 | cut -f1 -d"/")
+        if [ -n "$SDK_DIR" ] && [ -d "$SDK_DIR" ]; then
+          mv "$SDK_DIR" sdk-x86_64
+          echo "SDK extracted to sdk-x86_64"
+          echo "=== SDK contents ==="
+          ls -la sdk-x86_64/ | head -10
+        else
+          echo "ERROR: Failed to extract SDK or find SDK directory"
+          echo "Tar contents:"
+          tar -tf sdk.tar | head -10
+          exit 1
+        fi
+        
+        # 清理臨時檔案
+        rm sdk.tar.zst sdk.tar
+
+    - name: Verify SDK structure
+      run: |
+        echo "=== SDK structure verification ==="
+        if [ -d "sdk-x86_64" ]; then
+          echo "SDK directory exists"
+          ls -la sdk-x86_64/
+          echo ""
+          echo "=== Checking key files ==="
+          [ -f "sdk-x86_64/Makefile" ] && echo "✓ Makefile: OK" || echo "✗ Makefile: MISSING"
+          [ -d "sdk-x86_64/package" ] && echo "✓ package/: OK" || echo "✗ package/: MISSING"
+          [ -d "sdk-x86_64/scripts" ] && echo "✓ scripts/: OK" || echo "✗ scripts/: MISSING"
+          [ -d "sdk-x86_64/include" ] && echo "✓ include/: OK" || echo "✗ include/: MISSING"
+          [ -f "sdk-x86_64/feeds.conf.default" ] && echo "✓ feeds.conf.default: OK" || echo "✗ feeds.conf.default: MISSING"
+        else
+          echo "ERROR: sdk-x86_64 directory not found"
+          exit 1
+        fi
 
     - name: Setup OpenWrt SDK
       run: |
         cd sdk-x86_64
-        make tools/install -j$(nproc) > /dev/null 2>&1
-        make toolchain/install -j$(nproc) > /dev/null 2>&1
+        
+        echo "=== Setting up OpenWrt SDK ==="
+        echo "Current directory: $(pwd)"
+        echo "Disk space:"
+        df -h . | tail -1
+        
+        # 運行基本配置
+        echo "Running defconfig..."
+        make defconfig
+        
+        echo "Installing basic tools..."
+        make tools/install -j$(nproc)
+        
+        echo "SDK setup completed"
 
     - name: Create OpenWrt package structure
       run: |
@@ -245,14 +301,18 @@ jobs:
     - name: Build OpenWrt package
       run: |
         cd sdk-x86_64
-        make package/trafficmon/compile -j$(nproc)
-        make package/index -j$(nproc) > /dev/null 2>&1
+        echo "=== Building trafficmon package ==="
+        make package/trafficmon/compile -j$(nproc) V=s
+        
+        echo "Creating package index..."
+        make package/index -j$(nproc)
 
     - name: Collect IPK files
       run: |
         cd sdk-x86_64
         mkdir -p ../ipk-x86_64
         find bin -name "trafficmon*.ipk" -exec cp {} ../ipk-x86_64/ \;
+        echo "=== Generated IPK files ==="
         ls -lh ../ipk-x86_64/
 
     - name: Upload IPK package
@@ -271,7 +331,7 @@ jobs:
       ARCH: "aarch64_cortex-a53"
       TARGET: "mediatek/filogic"
       SDK_NAME: "openwrt-sdk-24.10.0-mediatek-filogic_gcc-13.3.0_musl.Linux-x86_64.tar.zst"
-      RUST_TARGET: "aarch64-unknown-linux-gnu"  # 改為 GNU 目標
+      RUST_TARGET: "aarch64-unknown-linux-gnu"
 
     steps:
     - name: Checkout code
@@ -313,14 +373,13 @@ jobs:
         
         echo "Build output:"
         ls -lh target-aarch64/${{ env.RUST_TARGET }}/release/trafficmon
-        file target-aarch64/${{ env.RUST_TARGET }}/release/trafficmon
 
     - name: Cache OpenWrt SDK
       id: cache-sdk-aarch64
       uses: actions/cache@v4
       with:
         path: sdk-aarch64
-        key: openwrt-sdk-${{ env.ARCH }}-${{ env.SDK_NAME }}-v8
+        key: openwrt-sdk-${{ env.ARCH }}-${{ env.SDK_NAME }}-v11
         restore-keys: |
           openwrt-sdk-${{ env.ARCH }}-${{ env.SDK_NAME }}-
 
@@ -330,16 +389,20 @@ jobs:
         SDK_URL="${{ env.MIRROR_URL }}/${{ env.TARGET }}/${{ env.SDK_NAME }}"
         echo "Downloading SDK..."
         curl -L --progress-bar -o sdk.tar.zst "$SDK_URL"
-        tar --use-compress-program=unzstd -xf sdk.tar.zst
-        SDK_DIR=$(tar --use-compress-program=unzstd -tf sdk.tar.zst | head -1 | cut -f1 -d"/")
+        
+        echo "Extracting SDK..."
+        zstd -d sdk.tar.zst
+        tar -xf sdk.tar
+        
+        SDK_DIR=$(tar -tf sdk.tar | head -1 | cut -f1 -d"/")
         mv "$SDK_DIR" sdk-aarch64
-        rm sdk.tar.zst
+        rm sdk.tar.zst sdk.tar
 
     - name: Setup OpenWrt SDK
       run: |
         cd sdk-aarch64
-        make tools/install -j$(nproc) > /dev/null 2>&1
-        make toolchain/install -j$(nproc) > /dev/null 2>&1
+        make defconfig
+        make tools/install -j$(nproc)
 
     - name: Create package and build
       run: |
@@ -355,7 +418,7 @@ jobs:
         
         # 快速編譯
         make package/trafficmon/compile -j$(nproc)
-        make package/index -j$(nproc) > /dev/null 2>&1
+        make package/index -j$(nproc)
 
     - name: Collect IPK files
       run: |
