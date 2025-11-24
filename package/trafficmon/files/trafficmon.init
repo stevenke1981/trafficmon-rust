@@ -1,175 +1,508 @@
+name: Build OpenWrt Package
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      ssh:
+        description: 'SSH connection to Actions'
+        required: false
+        default: 'false'
+env:
+  TZ: Asia/Shanghai
+  trafficmon-repo: ${{ github.repository }}
+
+jobs:
+  job_check:
+    name: Check Version
+    runs-on: ubuntu-latest
+    outputs:
+      trafficmon_version: ${{ steps.check_version.outputs.latest_version }}
+      has_update: ${{ steps.check_version.outputs.has_update }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@main
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref_name }}
+
+      - name: Check version
+        id: check_version
+        env:
+          url_tags: https://api.github.com/repos/${{ env.trafficmon-repo }}/releases/latest
+        run: |
+          # 從 Cargo.toml 提取版本號
+          if [ -f "Cargo.toml" ]; then
+            pkg_version=$(grep '^version =' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/' | tr -d ' ')
+          else
+            pkg_version="1.0.0"
+          fi
+          
+          # 格式化版本號
+          latest_version="v${pkg_version}"
+          echo "latest_version=${latest_version}" >> $GITHUB_OUTPUT
+
+          # 檢查遠程版本
+          remote_latest_version=$(wget -qO- -t1 -T2 ${{env.url_tags}} | jq -r '.tag_name')
+
+          if [ -z "$remote_latest_version" ] || [ "$remote_latest_version" = "null" ]; then
+            echo "Failed to fetch remote tags or no release exists"
+            echo "has_update=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "Remote latest: $remote_latest_version"
+
+          # 比較版本
+          if [ "$latest_version" = "$remote_latest_version" ]; then
+            echo "has_update=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_update=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Prepare release
+        if: steps.check_version.outputs.has_update == 'true'
+        run: |
+          echo "![](https://img.shields.io/github/downloads/${{ env.trafficmon-repo }}/${{steps.check_version.outputs.latest_version}}/total?style=flat-square) ![](https://github.com/${{ env.trafficmon-repo }}/actions/workflows/buildpackage.yml/badge.svg)" > release.txt
+          echo "" >> release.txt
+          echo "> 🚀 **trafficmon** - Network traffic monitor using nftables" >> release.txt
+          echo "> " >> release.txt
+          echo "> 📦 **Supported Architectures**: x86_64, aarch64_cortex-a53, arm_cortex-a7, mipsel_24kc" >> release.txt
+          echo "> " >> release.txt
+          echo "> ⚠️ **Note**: Packages for other platforms are currently being built. Files will be added to this release as they complete." >> release.txt
+          echo "> ⚠️ **注意**: 其他平台的软件包正在构建中，完成后将陆续添加到本页面" >> release.txt
+
+      - name: Generate new tag & release
+        if: steps.check_version.outputs.has_update == 'true'
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{steps.check_version.outputs.latest_version}}
+          name: ${{steps.check_version.outputs.latest_version}}
+          target_commitish: ${{ github.ref_name }}
+          body_path: release.txt
+
+  job_build:
+    name: Build trafficmon [${{ matrix.platform }}-${{ matrix.arch }}]
+    needs: job_check
+    if: needs.job_check.outputs.has_update == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: x86_64
+            url_sdk: https://downloads.openwrt.org/releases/24.10.0/targets/x86/64/openwrt-sdk-24.10.0-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst
+            rust_target: "x86_64-unknown-linux-musl"
+            arch: "x86_64"
+
+          - platform: aarch64_cortex-a53
+            url_sdk: https://downloads.openwrt.org/releases/24.10.0/targets/bcm27xx/bcm2710/openwrt-sdk-24.10.0-bcm27xx-bcm2710_gcc-13.3.0_musl.Linux-x86_64.tar.zst
+            rust_target: "aarch64-unknown-linux-musl"
+            arch: "aarch64_cortex-a53"
+
+          - platform: arm_cortex-a7
+            url_sdk: https://downloads.openwrt.org/releases/24.10.0/targets/bcm27xx/bcm2709/openwrt-sdk-24.10.0-bcm27xx-bcm2709_gcc-13.3.0_musl_eabi.Linux-x86_64.tar.zst
+            rust_target: "armv7-unknown-linux-musleabi"
+            arch: "arm_cortex-a7"
+
+          - platform: mipsel_24kc
+            url_sdk: https://downloads.openwrt.org/releases/24.10.0/targets/ramips/mt76x8/openwrt-sdk-24.10.0-ramips-mt76x8_gcc-13.3.0_musl.Linux-x86_64.tar.zst
+            rust_target: "mipsel-unknown-linux-musl"
+            arch: "mipsel_24kc"
+
+          - platform: arm_cortex-a15_neon-vfpv4
+            url_sdk: https://downloads.openwrt.org/releases/24.10.0/targets/ipq806x/generic/openwrt-sdk-24.10.0-ipq806x-generic_gcc-13.3.0_musl_eabi.Linux-x86_64.tar.zst
+            rust_target: "armv7-unknown-linux-musleabihf"
+            arch: "arm_cortex-a15_neon-vfpv4"
+
+          - platform: aarch64_cortex-a72
+            url_sdk: https://downloads.openwrt.org/releases/24.10.0/targets/bcm27xx/bcm2711/openwrt-sdk-24.10.0-bcm27xx-bcm2711_gcc-13.3.0_musl.Linux-x86_64.tar.zst
+            rust_target: "aarch64-unknown-linux-musl"
+            arch: "aarch64_cortex-a72"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@main
+        with:
+          fetch-depth: 0
+
+      - name: Install packages
+        run: |
+          sudo -E rm -rf /usr/share/dotnet /etc/mysql /etc/php /usr/local/lib/android
+          echo "Install packages"
+          sudo -E apt-get -qq update
+          sudo -E apt-get -qq install ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
+            bzip2 ccache clang cmake cpio curl device-tree-compiler ecj fastjar flex gawk gettext gcc-multilib \
+            g++-multilib git gnutls-dev gperf haveged help2man intltool lib32gcc-s1 libc6-dev-i386 libelf-dev \
+            libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses-dev libpython3-dev \
+            libreadline-dev libssl-dev libtool libyaml-dev libz-dev lld llvm lrzsz mkisofs msmtp nano \
+            ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip python3-ply python3-docutils \
+            python3-pyelftools qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo uglifyjs \
+            upx-ucl unzip vim wget xmlto xxd zlib1g-dev zstd jq
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ matrix.rust_target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.rust_target }}-
+
+      - name: Download and extract SDK
+        run: |
+          wget ${{ matrix.url_sdk }}
+          file_name=$(echo ${{ matrix.url_sdk }} | awk -F/ '{print $NF}')
+          mkdir -p sdk
+          if [[ $file_name == *.tar.xz ]]; then
+            tar -xJf $file_name -C ./sdk --strip-components=1
+          elif [[ $file_name == *.tar.zst ]]; then
+            tar --zstd -x -f $file_name -C ./sdk --strip-components=1
+          else
+            echo "Unsupported file format: $file_name"
+            exit 1
+          fi
+          rm -f $file_name
+
+      - name: Initialize SDK environment
+        run: |
+          cd sdk
+
+          # Update feeds to github source
+          sed -i \
+              -e 's|git\.openwrt\.org/feed|github.com/openwrt|g' \
+              -e 's|git\.openwrt\.org/project|github.com/openwrt|g' \
+              -e 's|git\.openwrt\.org/openwrt|github.com/openwrt|g' \
+              "feeds.conf.default"
+
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+          #--------------------------------------begin_patches------------------------------------------
+          echo "Start applying the patch"
+
+          # 更新必要的組件
+          rm -rf temp_resp
+          git clone -b master --single-branch https://github.com/openwrt/packages.git temp_resp
+          echo "update golang version"
+          rm -rf feeds/packages/lang/golang
+          cp -r temp_resp/lang/golang feeds/packages/lang
+          echo "update rust version"
+          rm -rf feeds/packages/lang/rust
+          cp -r temp_resp/lang/rust feeds/packages/lang
+          rm -rf temp_resp
+          
+          echo "update patch-kernel.sh"
+          git clone -b main --single-branch https://github.com/openwrt/openwrt.git temp_resp
+          cp -f temp_resp/scripts/patch-kernel.sh scripts/
+          rm -rf temp_resp
+
+          echo "Patch application completed"
+          #--------------------------------------end_patches--------------------------------------------
+
+      - name: Build Rust binary
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+          CARGO_INCREMENTAL: 0
+        run: |
+          # 添加 Rust 目標
+          rustup target add ${{ matrix.rust_target }}
+          
+          # 構建二進制文件
+          cargo build --release --target ${{ matrix.rust_target }}
+          
+          # 檢查構建結果
+          echo "Build output:"
+          ls -lh target/${{ matrix.rust_target }}/release/
+          file target/${{ matrix.rust_target }}/release/trafficmon
+
+      - name: Strip binary
+        run: |
+          cd sdk
+          
+          # 設置工具鏈路徑
+          export PATH="$(pwd)/staging_dir/toolchain-*/bin:$PATH"
+          
+          # 查找 strip 工具
+          STRIP_BIN=$(find staging_dir/toolchain-*/bin -name "*-strip" | head -1)
+          
+          if [ -n "$STRIP_BIN" ]; then
+            echo "Using strip: $STRIP_BIN"
+            $STRIP_BIN ../target/${{ matrix.rust_target }}/release/trafficmon
+            echo "After strip:"
+            ls -lh ../target/${{ matrix.rust_target }}/release/trafficmon
+          else
+            echo "Warning: strip not found, skipping"
+          fi
+
+      - name: Create package structure
+        run: |
+          cd sdk
+          
+          # 創建包目錄
+          rm -rf ./package/trafficmon
+          mkdir -p ./package/trafficmon/files
+          
+          # 複製二進制文件
+          cp ../target/${{ matrix.rust_target }}/release/trafficmon ./package/trafficmon/files/
+          chmod +x ./package/trafficmon/files/trafficmon
+          
+          # 從 Cargo.toml 讀取版本
+          if [ -f "../Cargo.toml" ]; then
+            PKG_VERSION=$(grep '^version =' ../Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/' | tr -d ' ')
+          else
+            PKG_VERSION="1.0.0"
+          fi
+          
+          # 創建 Makefile
+          cat > ./package/trafficmon/Makefile << 'EOF'
+include $(TOPDIR)/rules.mk
+
+PKG_NAME:=trafficmon
+PKG_VERSION:=$(shell echo "$PKG_VERSION")
+PKG_RELEASE:=1
+
+PKG_LICENSE:=MIT
+PKG_MAINTAINER:=Steven Ke <stevenke1981@gmail.com>
+
+include $(INCLUDE_DIR)/package.mk
+
+define Package/trafficmon
+  SECTION:=net
+  CATEGORY:=Network
+  TITLE:=Network traffic monitor using nftables
+  DEPENDS:=+nftables +kmod-nft-core
+  URL:=https://github.com/stevenke1981/trafficmon-rust
+endef
+
+define Package/trafficmon/description
+  Monitor network traffic on specified interfaces using nftables counters.
+  Outputs statistics to JSON format for easy integration.
+endef
+
+define Package/trafficmon/conffiles
+/etc/config/trafficmon
+endef
+
+define Build/Prepare
+	mkdir -p $(PKG_BUILD_DIR)
+endef
+
+define Build/Compile
+	# Binary already compiled by Rust
+endef
+
+define Package/trafficmon/install
+	$(INSTALL_DIR) $(1)/usr/bin
+	$(INSTALL_BIN) ./files/trafficmon $(1)/usr/bin/
+	
+	$(INSTALL_DIR) $(1)/etc/init.d
+	$(INSTALL_BIN) ./files/trafficmon.init $(1)/etc/init.d/trafficmon
+	
+	$(INSTALL_DIR) $(1)/etc/config
+	$(INSTALL_CONF) ./files/trafficmon.config $(1)/etc/config/trafficmon
+endef
+
+$(eval $(call BuildPackage,trafficmon))
+EOF
+          
+          # 創建 init 腳本
+          cat > ./package/trafficmon/files/trafficmon.init << 'EOF'
 #!/bin/sh /etc/rc.common
 
-# OpenWrt 服務啟動腳本
-# 用於管理 trafficmon 流量監控服務
-
-# 啟動順序 (較大的數字表示較晚啟動)
 START=99
-# 使用 procd 系統 (OpenWrt 的進程管理守護程式)
+STOP=10
+
 USE_PROCD=1
-# 程式執行檔路徑
 PROG=/usr/bin/trafficmon
 
-# 服務觸發器定義
-# 當 trafficmon 配置更改時自動重新加載服務
-service_triggers() {
-    procd_add_reload_trigger "trafficmon"
-}
-
-# 重新加載服務處理函數
-# 這裡直接重啟服務而不是重新加載配置
-reload_service() {
-    restart
-}
-
-# 啟動服務主函數
 start_service() {
-    # 定義局部變數用於存儲配置值
     local enabled
     local interfaces
     local interval
     local output_path
     
-    # 加載 trafficmon 配置
     config_load 'trafficmon'
-    
-    # 從配置文件中讀取 config 區段的參數
     config_get_bool enabled 'config' 'enabled' 0
     config_get interfaces 'config' 'interfaces' 'eth1 wan'
     config_get interval 'config' 'interval' '5'
     config_get output_path 'config' 'output_path' '/var/run/trafficmon.json'
     
-    # 檢查服務是否啟用
     [ "$enabled" -eq 0 ] && {
         logger -t trafficmon "trafficmon is disabled in config"
         return 1
     }
     
-    # 驗證介面是否存在
-    local valid_interfaces=""
-    for iface in $interfaces; do
-        if ip link show "$iface" >/dev/null 2>&1; then
-            valid_interfaces="$valid_interfaces $iface"
-            logger -t trafficmon "Interface $iface found"
-        else
-            logger -t trafficmon "Warning: Interface $iface not found, skipping"
-        fi
-    done
+    setup_nftables "$interfaces"
     
-    # 檢查是否至少有一個有效的網路介面
-    if [ -z "$valid_interfaces" ]; then
-        logger -t trafficmon "Error: No valid interfaces found"
-        return 1
-    fi
-    
-    # 設定 nftables
-    setup_nftables "$valid_interfaces"
-    
-    # 使用 procd 開啟服務實例
-    procd_open_instance trafficmon
-    # 設置啟動命令
+    procd_open_instance
     procd_set_param command $PROG
-    # 設置環境變數
-    procd_set_param env TRAFFICMON_INTERFACES="$valid_interfaces"
+    procd_set_param env TRAFFICMON_INTERFACES="$interfaces"
     procd_set_param env TRAFFICMON_INTERVAL="$interval"
     procd_set_param env TRAFFICMON_OUTPUT="$output_path"
-    # 設置進程重啟策略 (閾值, 超時, 重試次數)
-    procd_set_param respawn ${respawn_threshold:-3600} ${respawn_timeout:-5} ${respawn_retry:-5}
-    # 重定向標準錯誤輸出到日誌
-    procd_set_param stderr 1
-    # 重定向標準輸出到日誌
+    procd_set_param respawn 3600 5 5
     procd_set_param stdout 1
-    # 設置 PID 文件路徑
-    procd_set_param pidfile /var/run/trafficmon.pid
-    # 關閉服務實例配置
+    procd_set_param stderr 1
     procd_close_instance
     
-    logger -t trafficmon "trafficmon started monitoring:$valid_interfaces"
+    logger -t trafficmon "trafficmon started monitoring: $interfaces"
 }
 
-# nftables 設置函數
 setup_nftables() {
     local interfaces="$1"
     
-    # 檢查 table 是否存在，存在則刪除重建
-    if nft list table inet trafficmon >/dev/null 2>&1; then
-        logger -t trafficmon "nftables table already exists, recreating..."
-        nft delete table inet trafficmon 2>/dev/null || true
-    fi
-    
-    logger -t trafficmon "Creating nftables table and counters"
-    
-    # 建立 table
-    if ! nft add table inet trafficmon; then
-        logger -t trafficmon "Error: Failed to create nftables table"
-        return 1
-    fi
-    
-    # 為每個介面建立 counter
-    for iface in $interfaces; do
-        local counter_name="cnt_${iface}"
-        # 移除 pppoe-wan 中的 '-' 字元，改用底線
-        counter_name=$(echo "$counter_name" | sed 's/-/_/g')
+    nft list table inet trafficmon >/dev/null 2>&1 || {
+        logger -t trafficmon "Setting up nftables table and counters"
         
-        if ! nft add counter inet trafficmon "$counter_name"; then
-            logger -t trafficmon "Error: Failed to create counter for $iface"
-        else
-            logger -t trafficmon "Created counter: $counter_name for interface $iface"
-        fi
-    done
-    
-    # 建立 forward chain
-    if ! nft add chain inet trafficmon forward "{ type filter hook forward priority 0; }"; then
-        logger -t trafficmon "Error: Failed to create forward chain"
-        return 1
-    fi
-    
-    # 為每個介面建立規則
-    for iface in $interfaces; do
-        local counter_name="cnt_${iface}"
-        counter_name=$(echo "$counter_name" | sed 's/-/_/g')
+        nft add table inet trafficmon
         
-        # 入站流量
-        if ! nft add rule inet trafficmon forward iifname "$iface" counter name "$counter_name"; then
-            logger -t trafficmon "Warning: Failed to add input rule for $iface"
-        fi
+        for iface in $interfaces; do
+            nft add counter inet trafficmon "cnt_${iface}"
+        done
         
-        # 出站流量
-        if ! nft add rule inet trafficmon forward oifname "$iface" counter name "$counter_name"; then
-            logger -t trafficmon "Warning: Failed to add output rule for $iface"
-        fi
-    done
-    
-    logger -t trafficmon "nftables setup completed"
-    
-    # 顯示設定結果
-    logger -t trafficmon "Current nftables counters:"
-    nft list table inet trafficmon 2>&1 | logger -t trafficmon
-    
-    return 0
+        nft add chain inet trafficmon forward { type filter hook forward priority 0\; }
+        
+        for iface in $interfaces; do
+            nft add rule inet trafficmon forward iifname "$iface" counter name "cnt_${iface}"
+            nft add rule inet trafficmon forward oifname "$iface" counter name "cnt_${iface}"
+        done
+        
+        logger -t trafficmon "nftables setup completed"
+    }
 }
 
-# 停止服務處理函數
 stop_service() {
     logger -t trafficmon "Stopping trafficmon"
-    
-    # 清理 nftables table
-    if nft list table inet trafficmon >/dev/null 2>&1; then
-        logger -t trafficmon "Cleaning up nftables table"
-        nft delete table inet trafficmon 2>/dev/null || true
-    fi
 }
 
-# 服務狀態檢查函數
-status() {
-    if [ -f /var/run/trafficmon.json ]; then
-        echo "trafficmon is running"
-        echo "Last update:"
-        cat /var/run/trafficmon.json
-        echo ""
-        echo "nftables status:"
-        nft list table inet trafficmon 2>/dev/null || echo "nftables table not found"
-    else
-        echo "trafficmon is not running or no data available"
-    fi
+service_triggers() {
+    procd_add_reload_trigger "trafficmon"
 }
+
+reload_service() {
+    stop
+    start
+}
+EOF
+          
+          # 創建配置文件
+          cat > ./package/trafficmon/files/trafficmon.config << 'EOF'
+config trafficmon 'config'
+	option enabled '1'
+	option interfaces 'eth1 wan'
+	option interval '5'
+	option output_path '/var/run/trafficmon.json'
+EOF
+          
+          chmod +x ./package/trafficmon/files/trafficmon.init
+
+      - name: Compile package
+        id: compile
+        run: |
+          cd sdk
+          echo "CONFIG_ALL_NONSHARED=n" > .config
+          echo "CONFIG_ALL_KMODS=n" >> .config
+          echo "CONFIG_ALL=n" >> .config
+          echo "CONFIG_AUTOREMOVE=n" >> .config
+          echo "CONFIG_PACKAGE_trafficmon=m" >> .config
+          echo "CONFIG_PACKAGE_nftables=y" >> .config
+          echo "CONFIG_PACKAGE_kmod-nft-core=y" >> .config
+          
+          make defconfig
+          
+          # 編譯 trafficmon 包
+          make package/trafficmon/{clean,compile} -j$(nproc) V=s || {
+            echo "編譯 trafficmon 失敗，仍將嘗試檢查產物"
+          }
+          
+          # 獲取架構信息
+          arch=""
+          if [ -f .config ]; then
+            arch=$(grep "CONFIG_TARGET_ARCH_PACKAGES=" ".config" | cut -d '"' -f2)
+          fi
+          
+          if [ -z "$arch" ]; then
+            echo "未能從 .config 解析到 CONFIG_TARGET_ARCH_PACKAGES，嘗試從路徑獲取"
+            arch=$(find bin/packages -mindepth 1 -maxdepth 1 -type d ! -name ".*" | head -1 | xargs basename)
+          fi
+          
+          if [ -z "$arch" ]; then
+            echo "無法確定架構信息，使用默認路徑"
+            arch="*"
+          fi
+          
+          echo "檢測到架構: [$arch]"
+          
+          # 檢查產物路徑
+          BIN_DIR_CUSTOM="bin/packages/$arch/custom"
+          BIN_DIR_BASE="bin/packages/$arch/base"
+          
+          mkdir -p upload
+          
+          # 查找產物
+          found_pkgs=()
+          if [ -d "$BIN_DIR_CUSTOM" ]; then
+            while IFS= read -r -d '' pkg; do
+              found_pkgs+=("$pkg")
+            done < <(find "$BIN_DIR_CUSTOM" -maxdepth 1 -type f \( -name 'trafficmon-*.ipk' -o -name 'trafficmon_*.ipk' \) -print0 2>/dev/null)
+          fi
+          
+          if [ ${#found_pkgs[@]} -eq 0 ] && [ -d "$BIN_DIR_BASE" ]; then
+            while IFS= read -r -d '' pkg; do
+              found_pkgs+=("$pkg")
+            done < <(find "$BIN_DIR_BASE" -maxdepth 1 -type f \( -name 'trafficmon-*.ipk' -o -name 'trafficmon_*.ipk' \) -print0 2>/dev/null)
+          fi
+          
+          if [ ${#found_pkgs[@]} -eq 0 ]; then
+            echo "未找到 trafficmon 的 ipk 產物"
+            exit 1
+          fi
+          
+          # 複製並重命名產物
+          for pkg in "${found_pkgs[@]}"; do
+            filename="$(basename "$pkg")"
+            ext="${filename##*.}"
+            name_no_ext="${filename%.*}"
+            
+            # 轉義架構名稱中的特殊字符用於正則表達式匹配
+            arch_escaped=$(echo "$arch" | sed 's/[.*+?^${}()|[\]\\]/\\&/g')
+            
+            # 若文件名末尾尚未包含 _${arch} 或 -${arch}，則在擴展名前追加 _${arch}
+            if [[ "$name_no_ext" =~ (^|[_-])${arch_escaped}$ ]]; then
+              new_name="$filename"
+            else
+              new_name="${name_no_ext}_${arch}.${ext}"
+            fi
+            
+            echo "複製產物: $pkg -> upload/$new_name"
+            cp -f "$pkg" "upload/$new_name" || {
+              echo "複製失敗: $pkg"
+              exit 1
+            }
+          done
+          
+          if [ ! -d "upload" ] || [ -z "$(ls -A upload 2>/dev/null)" ]; then
+            echo "錯誤: upload 目錄不存在或為空"
+            exit 1
+          fi
+          
+          cd upload
+          echo "status=success" >> $GITHUB_OUTPUT
+          echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        if: steps.compile.outputs.status == 'success'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{needs.job_check.outputs.trafficmon_version}}
+          files: ${{ env.FIRMWARE }}/*
