@@ -115,9 +115,9 @@ jobs:
       uses: actions/cache@v4
       with:
         path: sdk
-        key: openwrt-sdk-${{ matrix.sdk_name }}-${{ hashFiles('.github/workflows/build.yml') }}
+        key: openwrt-sdk-${{ matrix.arch }}-${{ matrix.sdk_name }}-${{ hashFiles('.github/workflows/build.yml') }}
         restore-keys: |
-          openwrt-sdk-${{ matrix.sdk_name }}-
+          openwrt-sdk-${{ matrix.arch }}-${{ matrix.sdk_name }}-
 
     - name: Download and extract OpenWrt SDK
       if: steps.cache-sdk.outputs.cache-hit != 'true'
@@ -162,6 +162,15 @@ jobs:
         # 更新 feeds (限制時間)
         timeout 300 ./scripts/feeds update -a || echo "Feed update timed out, continuing..."
         timeout 300 ./scripts/feeds install -a || echo "Feed install timed out, continuing..."
+    
+    - name: Clean SDK if cached
+      if: steps.cache-sdk.outputs.cache-hit == 'true'
+      run: |
+        cd sdk
+        echo "Cleaning cached SDK..."
+        make clean || true
+        rm -rf build_dir/target-* staging_dir/target-* tmp/ .config.old || true
+        echo "SDK cleaned"
 
     - name: Build Rust binary
       env:
@@ -357,6 +366,10 @@ jobs:
     - name: Configure SDK
       run: |
         cd sdk
+        
+        # 確保清理舊的設定
+        rm -f .config .config.old
+        
         make defconfig
         
         echo "=== Disk space after defconfig ==="
