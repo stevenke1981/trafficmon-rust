@@ -1,4 +1,4 @@
-name: Build and Release OpenWrt Rust Package for Filogic Cortex-A53
+name: Build OpenWrt Rust Package for Filogic Cortex-A53
 
 on:
   push:
@@ -34,26 +34,15 @@ jobs:
           xz-utils \
           zstd \
           gcc-aarch64-linux-gnu \
-          file \
-          aria2
-
-    - name: Cache OpenWrt SDK
-      uses: actions/cache@v3
-      id: sdk-cache
-      with:
-        path: openwrt-sdk
-        key: ${{ runner.os }}-openwrt-sdk-24.10.0-${{ hashFiles('Cargo.toml') }}
+          file
 
     - name: Download and Extract OpenWrt SDK
-      if: steps.sdk-cache.outputs.cache-hit != 'true'
       run: |
-        echo "Downloading SDK with aria2c (multi-threaded)..."
-        aria2c -x 16 -s 16 --continue=true $SDK_URL -o sdk.tar.zst
-        echo "Extracting SDK..."
+        wget -O sdk.tar.zst $SDK_URL
         unzstd sdk.tar.zst || tar -I zstd -xf sdk.tar.zst
         tar -xf sdk.tar
         mv openwrt-sdk-* openwrt-sdk
-        echo "SDK downloaded and extracted successfully"
+        echo "SDK extracted successfully"
 
     - name: Set ENV Paths
       run: |
@@ -85,15 +74,12 @@ jobs:
         mkdir -p openwrt-package/usr/bin
         mkdir -p openwrt-package/CONTROL
         
+        # 注意：路徑改為 aarch64-unknown-linux-musl
         find target/aarch64-unknown-linux-musl/release/ -maxdepth 1 -type f -executable -exec cp {} openwrt-package/usr/bin/ \;
-        
-        # 獲取版本號從 Cargo.toml 或使用 git describe
-        VERSION=$(grep -m1 version Cargo.toml | cut -d'"' -f2 || echo "1.0.0")
-        GIT_HASH=$(git rev-parse --short HEAD)
         
         cat > openwrt-package/CONTROL/control << EOF
         Package: trafficmon-rust
-        Version: ${VERSION}-${GIT_HASH}
+        Version: 1.0-$(date +%Y%m%d)
         Depends: libc
         Section: utils
         Architecture: $OPENWRT_ARCH
@@ -108,11 +94,9 @@ jobs:
         tar -czf ipk/control.tar.gz -C openwrt-package/CONTROL .
 
         mkdir -p bin
-        VERSION=$(grep -m1 version Cargo.toml | cut -d'"' -f2 || echo "1.0.0")
-        GIT_HASH=$(git rev-parse --short HEAD)
-        cd ipk && ar r ../bin/trafficmon-rust_${VERSION}-${GIT_HASH}_${OPENWRT_ARCH}.ipk debian-binary control.tar.gz data.tar.gz && cd ..
+        cd ipk && ar r ../bin/trafficmon-rust_${OPENWRT_ARCH}.ipk debian-binary control.tar.gz data.tar.gz && cd ..
 
-    - name: Upload Build Artifacts
+    - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:
         name: openwrt-rust-cortex-a53
@@ -120,44 +104,3 @@ jobs:
           bin/
           target/aarch64-unknown-linux-musl/release/
         retention-days: 30
-
-  release:
-    needs: build
-    runs-on: ubuntu-latest
-    if: github.event_name == 'release' && github.event.action == 'published'
-    
-    steps:
-    - name: Download Build Artifacts
-      uses: actions/download-artifact@v4
-      with:
-        name: openwrt-rust-cortex-a53
-        path: artifacts/
-
-    - name: Display structure of downloaded files
-      run: ls -la artifacts/
-
-    - name: Create Release
-      uses: softprops/action-gh-release@v1
-      with:
-        files: |
-          artifacts/bin/*.ipk
-          artifacts/release/trafficmon
-        body: |
-          OpenWrt IPK package for MT7981/MT7986 (Cortex-A53)
-          
-          ### Installation
-          ```bash
-          opkg install trafficmon-rust_*.ipk
-          ```
-          
-          ### Architecture
-          - Target: ${{ env.OPENWRT_ARCH }}
-          - Chipset: MediaTek Filogic (MT7981/MT7986)
-          - CPU: Cortex-A53
-          
-          ### Build Info
-          - OpenWrt SDK: 24.10.0
-          - Rust: stable
-          - Built on: ${{ github.event.release.published_at }}
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
