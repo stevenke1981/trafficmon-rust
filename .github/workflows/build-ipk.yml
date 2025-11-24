@@ -30,33 +30,16 @@ jobs:
       run: |
         echo "=== Initial disk space ==="
         df -h / | tail -1
-        
-        echo "=== Quick cleanup ==="
-        # 快速移除已知的大目錄（並行執行）
-        {
-          sudo rm -rf /usr/share/dotnet &
-          sudo rm -rf /usr/local/lib/android &
-          sudo rm -rf /opt/hostedtoolcache/CodeQL &
-          sudo rm -rf /usr/local/share/chromium &
-          sudo rm -rf /usr/local/lib/node_modules &
-          wait
-        }
-        
-        # 清理 apt 緩存（不自動移除）
-        sudo apt-get clean
-        
-        # 清理日誌檔案
-        sudo find /var/log -name "*.log" -type f -exec truncate -s 0 {} \; 2>/dev/null || true
-        
-        echo "=== After quick cleanup ==="
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/hostedtoolcache/CodeQL &
+        sudo apt-get clean &
+        wait
+        echo "=== After cleanup ==="
         df -h / | tail -1
-        echo "Available: $(df -h / | tail -1 | awk '{print $4}')"
 
     - name: Install dependencies
       run: |
         sudo apt-get update
-        # 只安裝必要套件，跳過建議和文檔
-        sudo apt-get install -y --no-install-recommends \
+        sudo apt-get install -y \
           build-essential \
           ccache \
           clang \
@@ -85,8 +68,7 @@ jobs:
           zstd \
           gcc-aarch64-linux-gnu \
           g++-aarch64-linux-gnu \
-          musl-tools \
-          musl-dev
+          musl-tools
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
@@ -103,30 +85,58 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-cargo-${{ env.RUST_TARGET }}-
 
-    - name: Build Rust binary
+    - name: Build Rust binary with proper musl linking
       env:
         CARGO_TARGET_DIR: ${{ github.workspace }}/target-x86_64
         CARGO_INCREMENTAL: 0
-        CARGO_NET_RETRY: 10
-        RUSTFLAGS: "-C target-feature=-crt-static"
       run: |
         echo "Building for target: ${{ env.RUST_TARGET }}"
         
         rustup target add ${{ env.RUST_TARGET }}
         
-        # 使用更快的編譯設定
+        # 方法 1: 使用正確的 musl 靜態連結
+        echo "=== Method 1: Proper musl static linking ==="
+        RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-lm" \
         cargo build --release --target ${{ env.RUST_TARGET }} --jobs $(nproc)
         
+        # 檢查是否成功
+        if [ ! -f "target-x86_64/${{ env.RUST_TARGET }}/release/trafficmon" ]; then
+          echo "Method 1 failed, trying method 2..."
+          # 方法 2: 不使用完全靜態，只連結數學庫
+          cargo clean
+          RUSTFLAGS="-C link-arg=-lm" \
+          cargo build --release --target ${{ env.RUST_TARGET }} --jobs $(nproc)
+        fi
+        
+        # 方法 3: 如果上面都失敗，使用 GNU 目標
+        if [ ! -f "target-x86_64/${{ env.RUST_TARGET }}/release/trafficmon" ]; then
+          echo "Method 2 failed, trying GNU target..."
+          cargo clean
+          GNU_TARGET="x86_64-unknown-linux-gnu"
+          rustup target add $GNU_TARGET
+          cargo build --release --target $GNU_TARGET --jobs $(nproc)
+          # 複製到預期位置
+          mkdir -p target-x86_64/${{ env.RUST_TARGET }}/release/
+          cp target-x86_64/$GNU_TARGET/release/trafficmon target-x86_64/${{ env.RUST_TARGET }}/release/
+          echo "Used GNU target as fallback"
+        fi
+        
         echo "Build output:"
-        ls -lh target-x86_64/${{ env.RUST_TARGET }}/release/trafficmon
-        file target-x86_64/${{ env.RUST_TARGET }}/release/trafficmon
+        ls -lh target-x86_64/${{ env.RUST_TARGET }}/release/trafficmon || echo "Binary not found"
+        
+        # 檢查二進位檔案類型
+        if [ -f "target-x86_64/${{ env.RUST_TARGET }}/release/trafficmon" ]; then
+          file target-x86_64/${{ env.RUST_TARGET }}/release/trafficmon
+          echo "Binary dependencies:"
+          ldd target-x86_64/${{ env.RUST_TARGET }}/release/trafficmon 2>/dev/null || echo "Static binary or ldd not available"
+        fi
 
     - name: Cache OpenWrt SDK
       id: cache-sdk-x86
       uses: actions/cache@v4
       with:
         path: sdk-x86_64
-        key: openwrt-sdk-${{ env.ARCH }}-${{ env.SDK_NAME }}-v4
+        key: openwrt-sdk-${{ env.ARCH }}-${{ env.SDK_NAME }}-v7
         restore-keys: |
           openwrt-sdk-${{ env.ARCH }}-${{ env.SDK_NAME }}-
 
@@ -135,46 +145,37 @@ jobs:
       run: |
         SDK_URL="${{ env.MIRROR_URL }}/${{ env.TARGET }}/${{ env.SDK_NAME }}"
         echo "Downloading SDK from: $SDK_URL"
-        
-        # 使用 curl 並顯示進度
         curl -L --progress-bar -o sdk.tar.zst "$SDK_URL"
-        
-        echo "Extracting SDK..."
         tar --use-compress-program=unzstd -xf sdk.tar.zst
-        
         SDK_DIR=$(tar --use-compress-program=unzstd -tf sdk.tar.zst | head -1 | cut -f1 -d"/")
         mv "$SDK_DIR" sdk-x86_64
         rm sdk.tar.zst
-        
-        echo "SDK extracted successfully"
 
     - name: Setup OpenWrt SDK
       run: |
         cd sdk-x86_64
-        
-        echo "=== Initial SDK structure ==="
-        ls -la | head -5
-        
-        # 並行安裝工具鏈
-        echo "Installing tools and toolchain..."
         make tools/install -j$(nproc) > /dev/null 2>&1
         make toolchain/install -j$(nproc) > /dev/null 2>&1
-        
-        echo "=== Disk space after toolchain ==="
-        df -h / | tail -1
 
     - name: Create OpenWrt package structure
       run: |
         cd sdk-x86_64
-        
-        # 創建 package 目錄結構
         mkdir -p package/trafficmon/files
         
-        # 複製編譯好的 binary
-        cp ../target-x86_64/${{ env.RUST_TARGET }}/release/trafficmon package/trafficmon/files/
+        # 檢查並複製二進位檔案
+        if [ -f "../target-x86_64/${{ env.RUST_TARGET }}/release/trafficmon" ]; then
+          cp "../target-x86_64/${{ env.RUST_TARGET }}/release/trafficmon" package/trafficmon/files/
+        elif [ -f "../target/x86_64-unknown-linux-musl/release/trafficmon" ]; then
+          cp "../target/x86_64-unknown-linux-musl/release/trafficmon" package/trafficmon/files/
+        else
+          echo "ERROR: No binary found!"
+          find ../ -name "trafficmon" -type f | head -10
+          exit 1
+        fi
+        
         chmod +x package/trafficmon/files/trafficmon
         
-        # 建立 Makefile
+        # 建立 Makefile（保持不變）
         cat > package/trafficmon/Makefile << 'EOF'
         include $(TOPDIR)/rules.mk
         
@@ -226,32 +227,23 @@ jobs:
         $(eval $(call BuildPackage,trafficmon))
         EOF
         
-        # 建立 init 腳本
+        # 建立 init 腳本和 config 檔案
         cat > package/trafficmon/files/trafficmon.init << 'EOF'
         #!/bin/sh /etc/rc.common
-        
         START=99
         STOP=10
-        
         USE_PROCD=1
         PROG=/usr/bin/trafficmon
         
         start_service() {
-            local enabled
-            local interfaces
-            local interval
-            local output_path
-            
+            local enabled interfaces interval output_path
             config_load 'trafficmon'
             config_get_bool enabled 'config' 'enabled' 0
             config_get interfaces 'config' 'interfaces' 'eth1 wan'
             config_get interval 'config' 'interval' '5'
             config_get output_path 'config' 'output_path' '/var/run/trafficmon.json'
             
-            [ "$enabled" -eq 0 ] && {
-                logger -t trafficmon "trafficmon is disabled in config"
-                return 1
-            }
+            [ "$enabled" -eq 0 ] && return 1
             
             procd_open_instance
             procd_set_param command $PROG
@@ -262,8 +254,6 @@ jobs:
             procd_set_param stdout 1
             procd_set_param stderr 1
             procd_close_instance
-            
-            logger -t trafficmon "trafficmon started monitoring: $interfaces"
         }
         
         stop_service() {
@@ -280,7 +270,6 @@ jobs:
         }
         EOF
         
-        # 建立 config 檔
         cat > package/trafficmon/files/trafficmon.config << 'EOF'
         config trafficmon 'config'
         	option enabled '1'
@@ -291,43 +280,17 @@ jobs:
         
         chmod +x package/trafficmon/files/trafficmon.init
 
-    - name: Build dependencies and package
+    - name: Build OpenWrt package
       run: |
         cd sdk-x86_64
-        
-        echo "=== Disk space before build ==="
-        df -h / | tail -1
-        
-        # 並行編譯依賴包（抑制詳細輸出）
-        echo "Building dependencies..."
-        make package/nftables/compile -j$(nproc) > /dev/null 2>&1 || echo "nftables compilation skipped"
-        make package/base-files/compile -j$(nproc) > /dev/null 2>&1 || echo "base-files compilation skipped"
-        
-        # 編譯主要套件（只顯示錯誤）
-        echo "Building trafficmon package..."
         make package/trafficmon/compile -j$(nproc)
-        
-        echo "Creating package index..."
         make package/index -j$(nproc) > /dev/null 2>&1
-        
-        echo "=== Disk space after build ==="
-        df -h / | tail -1
 
-    - name: Collect and verify IPK
+    - name: Collect IPK files
       run: |
         cd sdk-x86_64
-        
         mkdir -p ../ipk-x86_64
-        
-        # 尋找並複製 IPK 檔案
-        find bin -name "trafficmon*.ipk" -exec cp -v {} ../ipk-x86_64/ \;
-        
-        if [ ! "$(ls -A ../ipk-x86_64)" ]; then
-          echo "ERROR: No IPK files found!"
-          exit 1
-        fi
-        
-        echo "=== Generated IPK files ==="
+        find bin -name "trafficmon*.ipk" -exec cp {} ../ipk-x86_64/ \;
         ls -lh ../ipk-x86_64/
 
     - name: Upload IPK package
@@ -336,29 +299,6 @@ jobs:
         name: trafficmon-x86_64-ipk
         path: ipk-x86_64/*.ipk
         if-no-files-found: error
-        retention-days: 7
-
-    - name: Create build info
-      run: |
-        cat > build-info-x86_64.txt << EOF
-        trafficmon Build Information
-        ============================
-        
-        Architecture: x86_64
-        OpenWrt Version: ${{ env.OPENWRT_VERSION }}
-        Build Date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
-        
-        Installation:
-        opkg install trafficmon_*.ipk
-        EOF
-        
-        cat build-info-x86_64.txt
-        
-    - name: Upload build info
-      uses: actions/upload-artifact@v4
-      with:
-        name: build-info-x86_64
-        path: build-info-x86_64.txt
 
   build-aarch64:
     needs: build-x86_64
@@ -375,22 +315,15 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Quick disk cleanup
-      run: |
-        echo "=== Initial disk space ==="
-        df -h / | tail -1
-        sudo apt-get clean
-        echo "=== After cleanup ==="
-        df -h / | tail -1
-
-    - name: Install minimal dependencies
+    - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y --no-install-recommends \
+        sudo apt-get install -y \
           build-essential \
           ca-certificates \
           curl \
-          file \
+          gcc-aarch64-linux-gnu \
+          g++-aarch64-linux-gnu \
           gawk \
           gettext \
           git \
@@ -399,33 +332,25 @@ jobs:
           python3 \
           wget \
           zstd
-        sudo apt-get clean
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
       with:
         targets: ${{ env.RUST_TARGET }}
 
-    - name: Cache Rust
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-        key: ${{ runner.os }}-cargo-${{ env.RUST_TARGET }}-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-cargo-${{ env.RUST_TARGET }}-
-
-    - name: Build Rust binary
+    - name: Build Rust binary for aarch64
       env:
         CARGO_TARGET_DIR: ${{ github.workspace }}/target-aarch64
         CARGO_INCREMENTAL: 0
-        RUSTFLAGS: "-C target-feature=-crt-static"
       run: |
         echo "Building for target: ${{ env.RUST_TARGET }}"
         rustup target add ${{ env.RUST_TARGET }}
+        
+        # 使用與 x86_64 相同的方法
+        RUSTFLAGS="-C link-arg=-lm" \
         cargo build --release --target ${{ env.RUST_TARGET }} --jobs $(nproc)
-        echo "Build completed"
+        
+        echo "Build output:"
         ls -lh target-aarch64/${{ env.RUST_TARGET }}/release/trafficmon
 
     - name: Cache OpenWrt SDK
@@ -433,7 +358,7 @@ jobs:
       uses: actions/cache@v4
       with:
         path: sdk-aarch64
-        key: openwrt-sdk-${{ env.ARCH }}-${{ env.SDK_NAME }}-v4
+        key: openwrt-sdk-${{ env.ARCH }}-${{ env.SDK_NAME }}-v7
         restore-keys: |
           openwrt-sdk-${{ env.ARCH }}-${{ env.SDK_NAME }}-
 
