@@ -1,254 +1,185 @@
-name: Create Release
+name: Build OpenWrt Package
 
 on:
   push:
-    tags:
-      - 'v*.*.*'
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
   workflow_dispatch:
-    inputs:
-      tag:
-        description: 'Release tag (e.g., v1.0.0)'
-        required: true
-        type: string
 
 env:
   OPENWRT_VERSION: "24.10.0"
   MIRROR_URL: "https://mirror-03.infra.openwrt.org/releases/24.10.0/targets"
 
 jobs:
-
-  # ------------------------------
-  # 1. Extract version once
-  # ------------------------------
-  get-version:
+  build:
     runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.get_version.outputs.version }}
-      version_number: ${{ steps.get_version.outputs.version_number }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86/64
+            sdk_name: openwrt-sdk-24.10.0-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst
+            rust_target: x86_64-unknown-linux-musl
+            
+          - arch: aarch64_cortex-a53
+            target: mediatek/filogic
+            sdk_name: openwrt-sdk-24.10.0-mediatek-filogic_gcc-13.3.0_musl.Linux-x86_64.tar.zst
+            rust_target: aarch64-unknown-linux-musl
+
     steps:
-      - name: Get version from tag
-        id: get_version
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            VERSION="${{ inputs.tag }}"
-          else
-            VERSION=${GITHUB_REF#refs/tags/}
-          fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "version_number=${VERSION#v}" >> $GITHUB_OUTPUT
+    - name: Checkout code
+      uses: actions/checkout@v4
 
+    - name: Free disk space
+      run: |
+        sudo rm -rf /usr/local/lib/android || true
+        docker rmi $(docker images -q) || true
 
-  # ------------------------------
-  # 2. Build x86_64 first
-  # ------------------------------
-  build-x86:
-    runs-on: ubuntu-latest
-    needs: get-version
-    outputs:
-      artifact: ${{ steps.find_ipk.outputs.ipk_file }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential ccache clang g++ gawk gettext git subversion \
+          libssl-dev libelf-dev zlib1g-dev python3 unzip rsync wget zstd \
+          gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
-      - name: Prepare builder (free disk etc.)
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
-          docker rmi $(docker images -q) || true
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ matrix.rust_target }}
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential clang gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-            gawk unzip wget rsync zstd python3 file
+    - name: Cache Rust
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+        key: rust-${{ matrix.rust_target }}-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-musl
+    - name: Cache OpenWrt SDK
+      id: cache-sdk
+      uses: actions/cache@v4
+      with:
+        path: sdk
+        key: sdk-${{ matrix.arch }}-${{ matrix.sdk_name }}
 
-      - name: Download OpenWrt SDK
-        run: |
-          ARCH="x86_64"
-          TARGET="x86/64"
-          SDK="openwrt-sdk-24.10.0-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst"
-          wget ${{ env.MIRROR_URL }}/$TARGET/$SDK
-          tar --zstd -xf $SDK
-          mv openwrt-sdk-* sdk
+    - name: Download SDK if not cached
+      if: steps.cache-sdk.outputs.cache-hit != 'true'
+      run: |
+        SDK_URL="${{ env.MIRROR_URL }}/${{ matrix.target }}/${{ matrix.sdk_name }}"
+        wget "$SDK_URL"
+        tar --zstd -xf "${{ matrix.sdk_name }}"
+        SDK_DIR=$(tar --zstd -tf "${{ matrix.sdk_name }}" | head -1 | cut -d/ -f1)
+        mv "$SDK_DIR" sdk
+        rm -f "${{ matrix.sdk_name }}"
 
-      - name: Build Rust binary
-        run: |
-          cargo build --release --target x86_64-unknown-linux-musl
+    - name: Verify SDK
+      run: |
+        ls -l sdk
+        echo "SDK OK"
 
-      - name: Strip binary with SDK toolchain
-        run: |
-          cd sdk
-          export PATH="$(pwd)/staging_dir/toolchain-*/bin:$PATH"
-          STRIP=$(find staging_dir/toolchain-*/bin -name "*-strip" | head -n 1)
-          $STRIP ../target/x86_64-unknown-linux-musl/release/trafficmon
+    - name: Update SDK feeds
+      if: steps.cache-sdk.outputs.cache-hit != 'true'
+      run: |
+        cd sdk
+        sed -i '/luci/d' feeds.conf.default
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
 
-      - name: Build OpenWrt package (x86)
-        run: |
-          VERSION=${{ needs.get-version.outputs.version_number }}
-          cd sdk
-          mkdir -p package/trafficmon/files
-          cp ../target/x86_64-unknown-linux-musl/release/trafficmon package/trafficmon/files/
+    - name: Build Rust binary
+      run: |
+        cargo build --release --target ${{ matrix.rust_target }}
+        mkdir -p output
+        cp target/${{ matrix.rust_target }}/release/trafficmon output/trafficmon
 
-          cat > package/trafficmon/Makefile <<EOF
-include \$(TOPDIR)/rules.mk
+    - name: Strip binary
+      run: |
+        cd sdk
+        export PATH="$(pwd)/staging_dir/toolchain-*/bin:$PATH"
+        STRIP=$(find staging_dir -name "*-strip" | head -1)
+        $STRIP ../output/trafficmon || true
+
+    - name: Create package folder
+      run: |
+        cd sdk
+        mkdir -p package/trafficmon
+        mkdir -p package/trafficmon/files
+
+        cp ../output/trafficmon package/trafficmon/files/
+        chmod +x package/trafficmon/files/trafficmon
+
+        cat > package/trafficmon/Makefile << 'EOF'
+include $(TOPDIR)/rules.mk
 
 PKG_NAME:=trafficmon
-PKG_VERSION:=$VERSION
+PKG_VERSION:=1.0.0
 PKG_RELEASE:=1
 
-include \$(INCLUDE_DIR)/package.mk
+PKG_LICENSE:=MIT
+PKG_MAINTAINER:=Steven Ke
+
+include $(INCLUDE_DIR)/package.mk
 
 define Package/trafficmon
   SECTION:=net
   CATEGORY:=Network
-  TITLE:=Traffic Monitor
+  TITLE:=Rust Traffic Monitor
+  DEPENDS:=+nftables
 endef
 
 define Package/trafficmon/install
-  \$(INSTALL_DIR) \$(1)/usr/bin
-  \$(INSTALL_BIN) ./files/trafficmon \$(1)/usr/bin/
+	$(INSTALL_DIR) $(1)/usr/bin
+	$(INSTALL_BIN) ./files/trafficmon $(1)/usr/bin/
+
+	$(INSTALL_DIR) $(1)/etc/init.d
+	$(INSTALL_BIN) ./files/trafficmon.init $(1)/etc/init.d/trafficmon
+
+	$(INSTALL_DIR) $(1)/etc/config
+	$(INSTALL_CONF) ./files/trafficmon.config $(1)/etc/config/trafficmon
 endef
 
-\$(eval \$(call BuildPackage,trafficmon))
+$(eval $(call BuildPackage,trafficmon))
 EOF
 
-          make defconfig
-          make package/trafficmon/compile -j$(nproc)
+        cat > package/trafficmon/files/trafficmon.init << 'EOF'
+#!/bin/sh /etc/rc.common
+START=99
+USE_PROCD=1
+PROG=/usr/bin/trafficmon
 
-      - name: Collect IPK (x86)
-        id: find_ipk
-        run: |
-          mkdir -p release
-          FILE=$(find sdk/bin/packages -name "*.ipk" | head -1)
-          NEW="trafficmon-${{ needs.get-version.outputs.version }}-openwrt-${{ env.OPENWRT_VERSION }}-x86_64.ipk"
-          cp "$FILE" "release/$NEW"
-          echo "ipk_file=release/$NEW" >> $GITHUB_OUTPUT
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ipk-x86_64
-          path: release/*
-
-
-  # ------------------------------
-  # 3. Build aarch64 in next job
-  # ------------------------------
-  build-aarch64:
-    runs-on: ubuntu-latest
-    needs: 
-      - get-version
-      - build-x86
-    outputs:
-      artifact: ${{ steps.find_ipk.outputs.ipk_file }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential gawk unzip wget rsync zstd gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-unknown-linux-musl
-
-      - name: Download OpenWrt SDK (Filogic)
-        run: |
-          ARCH="aarch64_cortex-a53"
-          TARGET="mediatek/filogic"
-          SDK="openwrt-sdk-24.10.0-mediatek-filogic_gcc-13.3.0_musl.Linux-x86_64.tar.zst"
-          wget ${{ env.MIRROR_URL }}/$TARGET/$SDK
-          tar --zstd -xf $SDK
-          mv openwrt-sdk-* sdk
-
-      - name: Build Rust binary
-        run: |
-          cargo build --release --target aarch64-unknown-linux-musl
-
-      - name: Strip binary
-        run: |
-          cd sdk
-          export PATH="$(pwd)/staging_dir/toolchain-*/bin:$PATH"
-          STRIP=$(find staging_dir/toolchain-*/bin -name "*-strip" | head -n 1)
-          $STRIP ../target/aarch64-unknown-linux-musl/release/trafficmon
-
-      - name: Build OpenWrt package (aarch64)
-        run: |
-          VERSION=${{ needs.get-version.outputs.version_number }}
-          cd sdk
-          mkdir -p package/trafficmon/files
-          cp ../target/aarch64-unknown-linux-musl/release/trafficmon package/trafficmon/files/
-
-          cat > package/trafficmon/Makefile <<EOF
-include \$(TOPDIR)/rules.mk
-
-PKG_NAME:=trafficmon
-PKG_VERSION:=$VERSION
-PKG_RELEASE:=1
-
-include \$(INCLUDE_DIR)/package.mk
-
-define Package/trafficmon
-  SECTION:=net
-  CATEGORY:=Network
-  TITLE:=Traffic Monitor
-endef
-
-define Package/trafficmon/install
-  \$(INSTALL_DIR) \$(1)/usr/bin
-  \$(INSTALL_BIN) ./files/trafficmon \$(1)/usr/bin/
-endef
-
-\$(eval \$(call BuildPackage,trafficmon))
+start_service() {
+    procd_open_instance
+    procd_set_param command $PROG
+    procd_close_instance
+}
 EOF
 
-          make defconfig
-          make package/trafficmon/compile -j$(nproc)
+        cat > package/trafficmon/files/trafficmon.config << 'EOF'
+config trafficmon 'config'
+	option enabled '1'
+	option interfaces 'wan eth1'
+	option interval '5'
+EOF
 
-      - name: Collect IPK (aarch64)
-        id: find_ipk
-        run: |
-          mkdir -p release
-          FILE=$(find sdk/bin/packages -name "*.ipk" | head -1)
-          NEW="trafficmon-${{ needs.get-version.outputs.version }}-openwrt-${{ env.OPENWRT_VERSION }}-aarch64_cortex-a53.ipk"
-          cp "$FILE" "release/$NEW"
-          echo "ipk_file=release/$NEW" >> $GITHUB_OUTPUT
+        chmod +x package/trafficmon/files/trafficmon.init
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ipk-aarch64
-          path: release/*
+    - name: Build package
+      run: |
+        cd sdk
+        make defconfig
+        make package/trafficmon/compile V=s -j$(nproc)
 
+    - name: Collect IPK
+      run: |
+        mkdir -p ipk
+        find sdk/bin/packages -name "trafficmon*.ipk" -exec cp {} ipk/ \;
+        ls -l ipk
 
-  # ------------------------------
-  # 4. Final Release Job
-  # ------------------------------
-  create-release:
-    runs-on: ubuntu-latest
-    needs:
-      - build-x86
-      - build-aarch64
-      - get-version
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: release
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: ${{ needs.get-version.outputs.version }}
-          name: Release ${{ needs.get-version.outputs.version }}
-          files: release/**/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Upload IPK
+      uses: actions/upload-artifact@v4
+      with:
+        name: trafficmon-${{ matrix.arch }}-ipk
+        path: ipk/*.ipk
