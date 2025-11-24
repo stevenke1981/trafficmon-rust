@@ -86,7 +86,7 @@ jobs:
           zstd \
           gcc-aarch64-linux-gnu \
           g++-aarch64-linux-gnu \
-          musl-tools \
+          musl-tools
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
