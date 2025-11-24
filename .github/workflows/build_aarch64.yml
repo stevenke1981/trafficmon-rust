@@ -39,7 +39,8 @@ jobs:
     - name: Download and Extract OpenWrt SDK
       run: |
         wget -O sdk.tar.zst $SDK_URL
-        tar -I zstd -xf sdk.tar.zst
+        unzstd sdk.tar.zst || tar -I zstd -xf sdk.tar.zst
+        tar -xf sdk.tar
         mv openwrt-sdk-* openwrt-sdk
         echo "SDK extracted successfully"
 
@@ -58,47 +59,23 @@ jobs:
       with:
         targets: aarch64-unknown-linux-musl
 
-    - name: Generate Correct Rust Target JSON
+    - name: Build with Built-in Target
       run: |
-        cat > aarch64_cortex-a53.json << 'EOF'
-        {
-          "llvm-target": "aarch64-unknown-linux-musl",
-          "arch": "aarch64",
-          "data-layout": "e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128",
-          "target-pointer-width": "64",
-          "target-endian": "little",
-          "os": "linux",
-          "env": "musl",
-          "vendor": "unknown",
-          "linker": "aarch64-openwrt-linux-musl-gcc",
-          "panic-strategy": "unwind",
-          "executables": true,
-          "linker-flavor": "gcc",
-          "cpu": "cortex-a53",
-          "features": "+fp-armv8,+neon",
-          "dynamic-linking": false,
-          "relocation-model": "static"
-        }
-        EOF
-
-    - name: Build Release Binary
-      run: |
-        export RUSTFLAGS="-C linker=aarch64-openwrt-linux-musl-gcc -C target-feature=+crt-static"
-        cargo build --release \
-          --target aarch64_cortex-a53.json
+        export RUSTFLAGS="-C linker=aarch64-openwrt-linux-musl-gcc -C link-arg=-static"
+        cargo build --release --target aarch64-unknown-linux-musl
 
     - name: Verify Binary
       run: |
-        file target/aarch64_cortex-a53/release/*
-        ls -la target/aarch64_cortex-a53/release/
+        file target/aarch64-unknown-linux-musl/release/*
+        ls -la target/aarch64-unknown-linux-musl/release/
 
     - name: Prepare OpenWrt Package Directory
       run: |
         mkdir -p openwrt-package/usr/bin
         mkdir -p openwrt-package/CONTROL
         
-        # 複製所有可執行文件
-        find target/aarch64_cortex-a53/release/ -maxdepth 1 -type f -executable -exec cp {} openwrt-package/usr/bin/ \;
+        # 注意：路徑改為 aarch64-unknown-linux-musl
+        find target/aarch64-unknown-linux-musl/release/ -maxdepth 1 -type f -executable -exec cp {} openwrt-package/usr/bin/ \;
         
         cat > openwrt-package/CONTROL/control << EOF
         Package: trafficmon-rust
@@ -125,5 +102,5 @@ jobs:
         name: openwrt-rust-cortex-a53
         path: |
           bin/
-          target/aarch64_cortex-a53/release/
+          target/aarch64-unknown-linux-musl/release/
         retention-days: 30
