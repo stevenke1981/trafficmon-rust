@@ -1,0 +1,275 @@
+name: Build and Release OpenWrt Rust Package for Filogic Cortex-A53
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  release:
+    types: [ published ]
+
+env:
+  TARGET: aarch64_cortex-a53
+  OPENWRT_ARCH: aarch64_cortex-a53
+  TOOLCHAIN_TRIPLE: aarch64-openwrt-linux-musl
+  SDK_URL: https://downloads.openwrt.org/releases/24.10.0/targets/mediatek/filogic/openwrt-sdk-24.10.0-mediatek-filogic_gcc-13.3.0_musl.Linux-x86_64.tar.zst
+  PACKAGE_NAME: trafficmon
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Install Build Dependencies
+      run: |
+        sudo apt update
+        sudo apt install -y \
+          build-essential \
+          clang \
+          llvm \
+          libc6-dev-i386 \
+          unzip \
+          xz-utils \
+          zstd \
+          gcc-aarch64-linux-gnu \
+          file \
+          aria2 \
+          jq
+
+    - name: Cache OpenWrt SDK
+      uses: actions/cache@v3
+      id: sdk-cache
+      with:
+        path: openwrt-sdk
+        key: ${{ runner.os }}-openwrt-sdk-24.10.0-${{ hashFiles('Cargo.toml') }}
+
+    - name: Download and Extract OpenWrt SDK
+      if: steps.sdk-cache.outputs.cache-hit != 'true'
+      run: |
+        echo "Downloading SDK with aria2c (multi-threaded)..."
+        aria2c -x 16 -s 16 --continue=true $SDK_URL -o sdk.tar.zst
+        echo "Extracting SDK..."
+        unzstd sdk.tar.zst || tar -I zstd -xf sdk.tar.zst
+        tar -xf sdk.tar
+        mv openwrt-sdk-* openwrt-sdk
+        echo "SDK downloaded and extracted successfully"
+
+    - name: Set ENV Paths
+      run: |
+        echo "STAGING_DIR=$GITHUB_WORKSPACE/openwrt-sdk/staging_dir" >> $GITHUB_ENV
+        echo "PATH=$GITHUB_WORKSPACE/openwrt-sdk/staging_dir/toolchain-aarch64_cortex-a53_gcc-13.3.0_musl/bin:$PATH" >> $GITHUB_ENV
+
+    - name: Verify Toolchain
+      run: |
+        which aarch64-openwrt-linux-musl-gcc
+        aarch64-openwrt-linux-musl-gcc --version
+
+    - name: Install Rust stable & target
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: aarch64-unknown-linux-musl
+
+    - name: Build with Built-in Target
+      run: |
+        export RUSTFLAGS="-C linker=aarch64-openwrt-linux-musl-gcc -C link-arg=-static"
+        cargo build --release --target aarch64-unknown-linux-musl
+
+    - name: Verify Binary
+      run: |
+        file target/aarch64-unknown-linux-musl/release/*
+        ls -la target/aarch64-unknown-linux-musl/release/
+
+    - name: Get Binary Name and Version
+      id: metadata
+      run: |
+        # 獲取版本號
+        VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        
+        # 獲取 Git hash
+        GIT_HASH=$(git rev-parse --short HEAD)
+        echo "git_hash=$GIT_HASH" >> $GITHUB_OUTPUT
+        
+        # 獲取二進位檔案名稱
+        BINARY_NAME=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[0].targets[] | select(.kind[] == "bin") | .name' | head -n1)
+        echo "binary_name=$BINARY_NAME" >> $GITHUB_OUTPUT
+        echo "Binary name: $BINARY_NAME"
+        echo "Version: $VERSION"
+        echo "Git hash: $GIT_HASH"
+
+    - name: Prepare OpenWrt Package Directory
+      run: |
+        PKG_DIR=openwrt-package
+        
+        # 創建目錄結構
+        mkdir -p $PKG_DIR/usr/bin
+        mkdir -p $PKG_DIR/etc/init.d
+        mkdir -p $PKG_DIR/etc/config
+        mkdir -p $PKG_DIR/CONTROL
+        
+        # 複製二進位檔案
+        BINARY_NAME="${{ steps.metadata.outputs.binary_name }}"
+        cp target/aarch64-unknown-linux-musl/release/$BINARY_NAME $PKG_DIR/usr/bin/
+        chmod +x $PKG_DIR/usr/bin/$BINARY_NAME
+        
+        # 複製 init 腳本 (如果存在)
+        if [ -f package/$PACKAGE_NAME/$PACKAGE_NAME.init ]; then
+          cp package/$PACKAGE_NAME/$PACKAGE_NAME.init $PKG_DIR/etc/init.d/$PACKAGE_NAME
+          chmod +x $PKG_DIR/etc/init.d/$PACKAGE_NAME
+          echo "Init script copied"
+        fi
+        
+        # 複製配置檔案 (如果存在)
+        if [ -f package/$PACKAGE_NAME/$PACKAGE_NAME.config ]; then
+          cp package/$PACKAGE_NAME/$PACKAGE_NAME.config $PKG_DIR/etc/config/$PACKAGE_NAME
+          echo "Config file copied"
+        fi
+        
+        # 創建 control 檔案
+        VERSION="${{ steps.metadata.outputs.version }}"
+        GIT_HASH="${{ steps.metadata.outputs.git_hash }}"
+        
+        cat > $PKG_DIR/CONTROL/control << EOF
+        Package: $PACKAGE_NAME
+        Version: ${VERSION}-${GIT_HASH}
+        Depends: libc
+        Section: utils
+        Priority: optional
+        Architecture: $OPENWRT_ARCH
+        Maintainer: ${{ github.repository_owner }}
+        Description: Rust traffic monitor for MT7981/MT7986 Cortex-A53
+         Built from ${{ github.repository }} @ ${GIT_HASH}
+        EOF
+        
+        # 顯示套件內容結構
+        echo "Package structure:"
+        tree $PKG_DIR || find $PKG_DIR -type f
+
+    - name: Build IPK Package
+      run: |
+        VERSION="${{ steps.metadata.outputs.version }}"
+        GIT_HASH="${{ steps.metadata.outputs.git_hash }}"
+        IPK_NAME="${PACKAGE_NAME}_${VERSION}-${GIT_HASH}_${OPENWRT_ARCH}.ipk"
+        
+        # 創建臨時目錄
+        mkdir -p ipk-build
+        
+        # 打包 data.tar.gz (套件內容)
+        cd openwrt-package
+        tar -czf ../ipk-build/data.tar.gz --owner=0 --group=0 .
+        cd ..
+        
+        # 打包 control.tar.gz (控制資訊)
+        cd openwrt-package/CONTROL
+        tar -czf ../../ipk-build/control.tar.gz --owner=0 --group=0 .
+        cd ../..
+        
+        # 創建 debian-binary
+        echo "2.0" > ipk-build/debian-binary
+        
+        # 組裝 IPK
+        mkdir -p bin
+        cd ipk-build
+        ar r ../bin/$IPK_NAME debian-binary control.tar.gz data.tar.gz
+        cd ..
+        
+        echo "IPK created: bin/$IPK_NAME"
+        ls -lh bin/$IPK_NAME
+
+    - name: Test IPK Structure
+      run: |
+        echo "=== IPK Contents ==="
+        ar t bin/*.ipk
+        echo ""
+        echo "=== Control Info ==="
+        ar p bin/*.ipk control.tar.gz | tar -xzO ./control
+        echo ""
+        echo "=== Data Files ==="
+        ar p bin/*.ipk data.tar.gz | tar -tzf -
+
+    - name: Upload Build Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: openwrt-${{ env.PACKAGE_NAME }}-${{ env.OPENWRT_ARCH }}
+        path: |
+          bin/*.ipk
+          target/aarch64-unknown-linux-musl/release/${{ steps.metadata.outputs.binary_name }}
+        retention-days: 30
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release' && github.event.action == 'published'
+    
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Get Metadata
+      id: metadata
+      run: |
+        VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        BINARY_NAME=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[0].targets[] | select(.kind[] == "bin") | .name' | head -n1)
+        echo "binary_name=$BINARY_NAME" >> $GITHUB_OUTPUT
+
+    - name: Download Build Artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: openwrt-${{ env.PACKAGE_NAME }}-${{ env.OPENWRT_ARCH }}
+        path: artifacts/
+
+    - name: Display Downloaded Files
+      run: |
+        echo "=== Artifact Structure ==="
+        ls -laR artifacts/
+
+    - name: Upload to Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          artifacts/bin/*.ipk
+          artifacts/${{ steps.metadata.outputs.binary_name }}
+        body: |
+          ## OpenWrt Package for MediaTek Filogic (MT7981/MT7986)
+          
+          ### 📦 Installation
+          ```bash
+          # 上傳 IPK 到路由器
+          scp trafficmon_*.ipk root@192.168.1.1:/tmp/
+          
+          # SSH 到路由器安裝
+          ssh root@192.168.1.1
+          opkg install /tmp/trafficmon_*.ipk
+          
+          # 啟動服務
+          /etc/init.d/trafficmon enable
+          /etc/init.d/trafficmon start
+          ```
+          
+          ### 🔧 Architecture Details
+          - **Target**: `${{ env.OPENWRT_ARCH }}`
+          - **Chipset**: MediaTek Filogic (MT7981/MT7986)
+          - **CPU**: ARM Cortex-A53 (64-bit)
+          - **libc**: musl (静態連結)
+          
+          ### 📋 Package Contents
+          - Binary: `/usr/bin/${{ steps.metadata.outputs.binary_name }}`
+          - Init script: `/etc/init.d/${{ env.PACKAGE_NAME }}`
+          - Config: `/etc/config/${{ env.PACKAGE_NAME }}`
+          
+          ### 🛠️ Build Information
+          - **Version**: `${{ steps.metadata.outputs.version }}`
+          - **OpenWrt SDK**: 24.10.0
+          - **Rust**: stable (latest)
+          - **Toolchain**: `aarch64-openwrt-linux-musl-gcc 13.3.0`
+          - **Built**: ${{ github.event.release.published_at }}
+          - **Commit**: ${{ github.sha }}
+          
+          ### 📝 Changelog
+          See [CHANGELOG.md](CHANGELOG.md) for details.
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
