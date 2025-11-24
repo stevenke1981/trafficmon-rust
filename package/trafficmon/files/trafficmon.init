@@ -1,14 +1,80 @@
 #!/bin/sh /etc/rc.common
+
 START=99
+STOP=10
+
 USE_PROCD=1
+PROG=/usr/bin/trafficmon
 
 start_service() {
+    local enabled
+    local interfaces
+    local interval
+    local output_path
+    
+    config_load 'trafficmon'
+    config_get_bool enabled 'config' 'enabled' 0
+    config_get interfaces 'config' 'interfaces' 'eth1 pppoe-wan'
+    config_get interval 'config' 'interval' '5'
+    config_get output_path 'config' 'output_path' '/var/run/trafficmon.json'
+    
+    [ "$enabled" -eq 0 ] && {
+        echo "trafficmon is disabled in config"
+        return 1
+    }
+    
+    # 確保 nftables 規則存在
+    setup_nftables "$interfaces"
+    
     procd_open_instance
-    procd_set_param command /usr/bin/trafficmon
-    procd_set_param respawn
+    procd_set_param command $PROG
+    procd_set_param env TRAFFICMON_INTERFACES="$interfaces"
+    procd_set_param env TRAFFICMON_INTERVAL="$interval"
+    procd_set_param env TRAFFICMON_OUTPUT="$output_path"
+    procd_set_param respawn ${respawn_threshold:-3600} ${respawn_timeout:-5} ${respawn_retry:-5}
+    procd_set_param stdout 1
+    procd_set_param stderr 1
     procd_close_instance
 }
 
 stop_service() {
-    killall trafficmon 2>/dev/null
+    echo "Stopping trafficmon..."
+}
+
+service_triggers() {
+    procd_add_reload_trigger "trafficmon"
+}
+
+setup_nftables() {
+    local interfaces="$1"
+    
+    # 檢查 table 是否存在
+    nft list table inet trafficmon >/dev/null 2>&1 || {
+        echo "Creating nftables table and counters..."
+        
+        # 建立 table
+        nft add table inet trafficmon
+        
+        # 為每個介面建立 counter
+        for iface in $interfaces; do
+            nft add counter inet trafficmon "cnt_${iface}"
+        done
+        
+        # 建立 chain 和規則
+        nft add chain inet trafficmon forward { type filter hook forward priority 0\; }
+        
+        for iface in $interfaces; do
+            # 入站流量
+            nft add rule inet trafficmon forward iifname "$iface" counter name "cnt_${iface}"
+            # 出站流量
+            nft add rule inet trafficmon forward oifname "$iface" counter name "cnt_${iface}"
+        done
+        
+        echo "nftables setup completed"
+    }
+}
+
+reload_service() {
+    stop
+    start
 }
