@@ -11,8 +11,8 @@ fn get_env_or_default(key: &str, default: &str) -> String {
 }
 
 fn get_interfaces() -> Vec<String> {
-    let ifaces_str = get_env_or_default("TRAFFICMON_INTERFACES", "eth1 pppoe-wan");
-    ifaces_str.split_whitespace().map(|s| s.to_string()).collect()
+    let ifaces_str = get_env_or_default("TRAFFICMON_INTERFACES", "eth1 wan");
+    ifaces_str.split_whitespace().map(|s| s.trim().to_string()).collect()
 }
 
 fn get_interval() -> u64 {
@@ -38,9 +38,18 @@ struct TrafficData {
     data: Vec<IfaceData>,
 }
 
-fn read_nft_counter(name: &str) -> Result<(u64, u64), String> {
+/// 將介面名稱轉換為合法的 nftables counter 名稱
+/// nftables 不允許 counter 名稱中有 '-' 字元
+fn sanitize_counter_name(iface: &str) -> String {
+    iface.replace('-', "_")
+}
+
+fn read_nft_counter(iface: &str) -> Result<(u64, u64), String> {
+    // 轉換介面名稱 (例如: pppoe-wan -> pppoe_wan)
+    let counter_name = format!("cnt_{}", sanitize_counter_name(iface));
+    
     let output = Command::new("nft")
-        .args(["list", "counter", "inet", "trafficmon", name])
+        .args(["list", "counter", "inet", "trafficmon", &counter_name])
         .output()
         .map_err(|e| format!("Failed to execute nft: {}", e))?;
 
@@ -53,6 +62,7 @@ fn read_nft_counter(name: &str) -> Result<(u64, u64), String> {
     let mut packets = 0u64;
     let mut bytes = 0u64;
 
+    // 解析 nftables 輸出: "counter packets X bytes Y"
     for line in txt.lines() {
         let words: Vec<&str> = line.split_whitespace().collect();
         for i in 0..words.len() {
@@ -92,8 +102,7 @@ fn collect_traffic_data(interfaces: &[String]) -> TrafficData {
     };
 
     for iface in interfaces {
-        let cname = format!("cnt_{}", iface);
-        match read_nft_counter(&cname) {
+        match read_nft_counter(iface) {
             Ok((packets, bytes)) => {
                 result.data.push(IfaceData {
                     iface: iface.clone(),
@@ -103,6 +112,7 @@ fn collect_traffic_data(interfaces: &[String]) -> TrafficData {
             }
             Err(e) => {
                 eprintln!("Error reading counter for {}: {}", iface, e);
+                // 失敗時仍然加入資料，但數值為 0
                 result.data.push(IfaceData {
                     iface: iface.clone(),
                     packets: 0,
@@ -144,6 +154,13 @@ async fn monitor_loop() {
     println!("Monitoring interfaces: {:?}", interfaces);
     println!("Output file: {}", output_path);
     println!("Update interval: {} seconds", interval);
+
+    // 顯示 counter 名稱對應
+    println!("Counter name mapping:");
+    for iface in &interfaces {
+        let counter_name = format!("cnt_{}", sanitize_counter_name(iface));
+        println!("  {} -> {}", iface, counter_name);
+    }
 
     if let Err(e) = reset_nft() {
         eprintln!("Warning: Failed to reset counters: {}", e);
