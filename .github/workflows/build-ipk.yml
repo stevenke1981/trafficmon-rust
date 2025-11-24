@@ -1,20 +1,27 @@
-name: Build OpenWrt Package
+name: Create Release
 
 on:
   push:
-    branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
+    tags:
+      - 'v*.*.*'  # 當推送 v1.0.0 這樣的 tag 時觸發
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g., v1.0.0)'
+        required: true
+        type: string
 
 env:
   OPENWRT_VERSION: "24.10.0"
   MIRROR_URL: "https://mirror-03.infra.openwrt.org/releases/24.10.0/targets"
 
 jobs:
-  build:
+  build-and-release:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    permissions:
+      contents: write  # 需要寫入權限來建立 release
+    
     strategy:
       fail-fast: false
       matrix:
@@ -32,6 +39,18 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
+
+    - name: Get version from tag
+      id: get_version
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          VERSION="${{ inputs.tag }}"
+        else
+          VERSION=${GITHUB_REF#refs/tags/}
+        fi
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "version_number=${VERSION#v}" >> $GITHUB_OUTPUT
+        echo "Release version: $VERSION"
 
     - name: Free disk space
       run: |
@@ -60,8 +79,6 @@ jobs:
         
         echo "=== After cleanup ==="
         df -h
-        echo "=== Available space in root ==="
-        df -h / | tail -1 | awk '{print "Available: " $4}'
 
     - name: Install dependencies
       run: |
@@ -105,17 +122,20 @@ jobs:
       uses: actions/cache@v4
       with:
         path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-          target
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+          target/${{ matrix.rust_target }}/release
         key: ${{ runner.os }}-cargo-${{ matrix.rust_target }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-${{ matrix.rust_target }}-
 
     - name: Cache OpenWrt SDK
       id: cache-sdk
       uses: actions/cache@v4
       with:
         path: sdk
-        key: openwrt-sdk-${{ matrix.arch }}-${{ matrix.sdk_name }}-${{ hashFiles('.github/workflows/build.yml') }}
+        key: openwrt-sdk-${{ matrix.arch }}-${{ matrix.sdk_name }}-${{ hashFiles('.github/workflows/release.yml') }}
         restore-keys: |
           openwrt-sdk-${{ matrix.arch }}-${{ matrix.sdk_name }}-
 
@@ -141,25 +161,16 @@ jobs:
           echo "Error: SDK directory not found"
           exit 1
         fi
-        echo "SDK directory found:"
-        ls -la sdk/ | head -20
-        
-        echo "=== Disk space after SDK ==="
+        echo "SDK directory found"
         df -h / | tail -1
 
     - name: Update SDK feeds
       if: steps.cache-sdk.outputs.cache-hit != 'true'
       run: |
         cd sdk
-        
-        # 移除 luci feed (如果存在)
         if [ -f feeds.conf.default ]; then
           sed -i '/luci/d' feeds.conf.default
-          echo "Updated feeds.conf.default:"
-          cat feeds.conf.default
         fi
-        
-        # 更新 feeds (限制時間)
         timeout 300 ./scripts/feeds update -a || echo "Feed update timed out, continuing..."
         timeout 300 ./scripts/feeds install -a || echo "Feed install timed out, continuing..."
     
@@ -170,7 +181,6 @@ jobs:
         echo "Cleaning cached SDK..."
         make clean || true
         rm -rf build_dir/target-* staging_dir/target-* tmp/ .config.old || true
-        echo "SDK cleaned"
 
     - name: Build Rust binary
       env:
@@ -181,35 +191,24 @@ jobs:
         echo "Building for target: ${{ matrix.rust_target }}"
         cargo build --release --target ${{ matrix.rust_target }}
         
-        # 檢查編譯結果
         echo "Build output:"
         ls -lh target/${{ matrix.rust_target }}/release/
         file target/${{ matrix.rust_target }}/release/trafficmon
         
-        # 清理編譯中間檔案
         cargo clean --target ${{ matrix.rust_target }} --release
         rm -rf target/${{ matrix.rust_target }}/release/{build,deps,examples,incremental}
         
-        echo "=== Disk space after Rust build ==="
         df -h / | tail -1
 
     - name: Strip binary using OpenWrt toolchain
       run: |
         cd sdk
-        
-        # 設定 PATH 以使用 OpenWrt toolchain
         export PATH="$(pwd)/staging_dir/toolchain-*/bin:$PATH"
-        
-        # 找到正確的 strip 工具
         STRIP_BIN=$(find staging_dir/toolchain-*/bin -name "*-strip" | head -1)
-        
         if [ -n "$STRIP_BIN" ]; then
           echo "Using strip: $STRIP_BIN"
           $STRIP_BIN ../target/${{ matrix.rust_target }}/release/trafficmon
-          echo "After strip:"
           ls -lh ../target/${{ matrix.rust_target }}/release/trafficmon
-        else
-          echo "Warning: strip not found, skipping"
         fi
 
     - name: Create package directory structure
@@ -217,16 +216,14 @@ jobs:
         cd sdk
         mkdir -p package/trafficmon/files
         
-        # 複製編譯好的 binary
         cp ../target/${{ matrix.rust_target }}/release/trafficmon package/trafficmon/files/
         chmod +x package/trafficmon/files/trafficmon
         
-        # 建立 Makefile
         cat > package/trafficmon/Makefile << 'EOF'
         include $(TOPDIR)/rules.mk
         
         PKG_NAME:=trafficmon
-        PKG_VERSION:=1.0.0
+        PKG_VERSION:=${{ steps.get_version.outputs.version_number }}
         PKG_RELEASE:=1
         
         PKG_LICENSE:=MIT
@@ -273,7 +270,6 @@ jobs:
         $(eval $(call BuildPackage,trafficmon))
         EOF
         
-        # 建立 init 腳本
         cat > package/trafficmon/files/trafficmon.init << 'EOF'
         #!/bin/sh /etc/rc.common
         
@@ -284,10 +280,7 @@ jobs:
         PROG=/usr/bin/trafficmon
         
         start_service() {
-            local enabled
-            local interfaces
-            local interval
-            local output_path
+            local enabled interfaces interval output_path
             
             config_load 'trafficmon'
             config_get_bool enabled 'config' 'enabled' 0
@@ -352,7 +345,6 @@ jobs:
         }
         EOF
         
-        # 建立 config 檔
         cat > package/trafficmon/files/trafficmon.config << 'EOF'
         config trafficmon 'config'
         	option enabled '1'
@@ -366,218 +358,207 @@ jobs:
     - name: Configure SDK
       run: |
         cd sdk
-        
-        # 確保清理舊的設定
         rm -f .config .config.old
-        
         make defconfig
-        
-        echo "=== Disk space after defconfig ==="
-        df -h / | tail -1
 
     - name: Build OpenWrt package
       run: |
         cd sdk
-        
         echo "=== Disk space before build ==="
         df -h / | tail -1
         
-        # 使用所有 CPU 核心加速編譯
         JOBS=$(nproc)
         echo "Building with $JOBS parallel jobs"
-        
         make package/trafficmon/compile V=s -j$JOBS || make package/trafficmon/compile V=s -j1
         
-        echo "=== Disk space after build ==="
-        df -h / | tail -1
-        
-        # 清理編譯中間檔案
         echo "=== Cleaning build artifacts ==="
         make clean || true
-        rm -rf build_dir/target-*/root-* 2>/dev/null || true
-        rm -rf staging_dir/target-*/root-* 2>/dev/null || true
-        
-        echo "=== Final disk space ==="
-        df -h / | tail -1
+        rm -rf build_dir/target-*/root-* staging_dir/target-*/root-* || true
 
-    - name: Find and organize IPK files
+    - name: Find and rename IPK files
+      id: find_ipk
       run: |
         cd sdk
-        mkdir -p ../ipk
+        mkdir -p ../release
         
-        # 尋找並複製 IPK 檔案
-        find bin/packages -name "trafficmon*.ipk" -exec cp -v {} ../ipk/ \;
+        IPK_FILE=$(find bin/packages -name "trafficmon*.ipk" | head -1)
+        if [ -z "$IPK_FILE" ]; then
+          echo "Error: No IPK file found"
+          exit 1
+        fi
         
-        # 顯示結果
-        echo "=== Generated IPK files ==="
-        ls -lh ../ipk/
+        # 重新命名為更友善的檔名
+        NEW_NAME="trafficmon-${{ steps.get_version.outputs.version }}-openwrt-${{ env.OPENWRT_VERSION }}-${{ matrix.arch }}.ipk"
+        cp "$IPK_FILE" "../release/$NEW_NAME"
         
-        # 顯示 IPK 內容
-        for ipk in ../ipk/trafficmon*.ipk; do
-          if [ -f "$ipk" ]; then
-            echo ""
-            echo "=== Contents of $(basename $ipk) ==="
-            tar -tzf "$ipk" | head -30
-          fi
-        done
+        echo "ipk_file=release/$NEW_NAME" >> $GITHUB_OUTPUT
+        echo "ipk_name=$NEW_NAME" >> $GITHUB_OUTPUT
+        
+        echo "=== Generated IPK ==="
+        ls -lh ../release/
+        file ../release/$NEW_NAME
 
-    - name: Upload IPK package
-      uses: actions/upload-artifact@v4
-      with:
-        name: trafficmon-${{ matrix.arch }}-ipk
-        path: ipk/*.ipk
-        if-no-files-found: error
-
-    - name: Create build info
+    - name: Generate checksums
       run: |
-        cat > build-info-${{ matrix.arch }}.txt << EOF
-        trafficmon Build Information
-        ============================
-        
-        Architecture: ${{ matrix.arch }}
-        OpenWrt Version: ${{ env.OPENWRT_VERSION }}
-        Target: ${{ matrix.target }}
-        Rust Target: ${{ matrix.rust_target }}
-        GCC Version: 13.3.0
-        
-        Build Information:
-        - Date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
-        - Commit: ${{ github.sha }}
-        - Branch: ${{ github.ref_name }}
-        - Workflow: ${{ github.workflow }}
-        
-        Installation:
-        1. scp trafficmon_*.ipk root@router:/tmp/
-        2. ssh root@router
-        3. opkg install /tmp/trafficmon_*.ipk
-        4. vi /etc/config/trafficmon
-        5. /etc/init.d/trafficmon enable
-        6. /etc/init.d/trafficmon start
-        
-        Usage:
-        - Config: /etc/config/trafficmon
-        - Output: /var/run/trafficmon.json
-        - Logs: logread | grep trafficmon
-        EOF
-        
-        cat build-info-${{ matrix.arch }}.txt
-        
-    - name: Upload build info
+        cd release
+        sha256sum *.ipk > SHA256SUMS
+        md5sum *.ipk > MD5SUMS
+        cat SHA256SUMS
+
+    - name: Upload IPK artifact
       uses: actions/upload-artifact@v4
       with:
-        name: build-info-${{ matrix.arch }}
-        path: build-info-${{ matrix.arch }}.txt
+        name: ipk-${{ matrix.arch }}
+        path: |
+          release/*.ipk
+          release/SHA256SUMS
+          release/MD5SUMS
 
   create-release:
-    needs: build
+    needs: build-and-release
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    permissions:
+      contents: write
     
     steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Get version
+      id: get_version
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          VERSION="${{ inputs.tag }}"
+        else
+          VERSION=${GITHUB_REF#refs/tags/}
+        fi
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+
     - name: Download all artifacts
       uses: actions/download-artifact@v4
-      
-    - name: Display structure
-      run: |
-        echo "=== Downloaded artifacts ==="
-        ls -R
-      
-    - name: Create release archives
+      with:
+        path: artifacts
+
+    - name: Organize release files
       run: |
         mkdir -p release
+        find artifacts -name "*.ipk" -exec cp {} release/ \;
+        find artifacts -name "SHA256SUMS" -exec cat {} \; > release/SHA256SUMS
+        find artifacts -name "MD5SUMS" -exec cat {} \; > release/MD5SUMS
         
-        for dir in trafficmon-*-ipk; do
-          if [ -d "$dir" ]; then
-            arch=$(echo $dir | sed 's/trafficmon-//;s/-ipk//')
-            echo "Creating archive for $arch"
-            tar czf release/trafficmon-openwrt24.10-${arch}.tar.gz -C $dir .
-          fi
-        done
-        
-        echo ""
         echo "=== Release files ==="
         ls -lh release/
-        
-    - name: Upload release archives
-      uses: actions/upload-artifact@v4
-      with:
-        name: trafficmon-openwrt-24.10-all
-        path: release/*.tar.gz
 
-    - name: Generate release summary
+    - name: Generate release notes
       run: |
-        cat > release/README.txt << 'EOF'
-        trafficmon - OpenWrt 24.10.0 Packages
-        ======================================
+        cat > release/RELEASE_NOTES.md << 'EOF'
+        # trafficmon ${{ steps.get_version.outputs.version }}
+
+        Network traffic monitor for OpenWrt using nftables counters.
+
+        ## 📦 Downloads
+
+        Download the IPK file for your router architecture:
+
+        - **x86_64**: x86 PCs, virtual machines
+        - **aarch64_cortex-a53**: MediaTek Filogic (MT798x) routers
+
+        ## 📋 Installation
+
+        ```bash
+        # 1. Download the appropriate IPK file for your architecture
         
-        Supported Architectures:
-        - x86_64: x86 PCs, virtual machines
-        - aarch64_cortex-a53: MediaTek Filogic (MT798x) routers
+        # 2. Copy to your OpenWrt router
+        scp trafficmon-*.ipk root@192.168.1.1:/tmp/
         
-        Installation Instructions:
-        ==========================
+        # 3. SSH into your router
+        ssh root@192.168.1.1
         
-        1. Download the IPK for your architecture
+        # 4. Install the package
+        opkg install /tmp/trafficmon-*.ipk
         
-        2. Copy to your OpenWrt router:
-           scp trafficmon_*.ipk root@192.168.1.1:/tmp/
+        # 5. Configure (optional)
+        vi /etc/config/trafficmon
         
-        3. SSH into your router:
-           ssh root@192.168.1.1
+        # 6. Enable and start service
+        /etc/init.d/trafficmon enable
+        /etc/init.d/trafficmon start
         
-        4. Install the package:
-           opkg install /tmp/trafficmon_*.ipk
-        
-        5. Configure (optional):
-           vi /etc/config/trafficmon
-           
-           Available options:
-           - enabled: 0/1 (disable/enable)
-           - interfaces: space-separated list (e.g., 'eth1 wan')
-           - interval: update interval in seconds
-           - output_path: JSON output file path
-        
-        6. Enable and start service:
-           /etc/init.d/trafficmon enable
-           /etc/init.d/trafficmon start
-        
-        7. Check status:
-           cat /var/run/trafficmon.json
-           logread | grep trafficmon
-        
-        Monitoring:
-        ===========
-        
-        View real-time data:
-           watch -n 1 cat /var/run/trafficmon.json
-        
+        # 7. Check status
+        cat /var/run/trafficmon.json
+        logread | grep trafficmon
+        ```
+
+        ## ⚙️ Configuration
+
+        Edit `/etc/config/trafficmon`:
+
+        ```
+        config trafficmon 'config'
+            option enabled '1'
+            option interfaces 'eth1 wan'
+            option interval '5'
+            option output_path '/var/run/trafficmon.json'
+        ```
+
+        ## 📊 Usage
+
+        View real-time traffic data:
+        ```bash
+        watch -n 1 cat /var/run/trafficmon.json
+        ```
+
         Check nftables counters:
-           nft list table inet trafficmon
-           nft list counter inet trafficmon cnt_eth1
-        
-        Restart service:
-           /etc/init.d/trafficmon restart
-        
-        Stop service:
-           /etc/init.d/trafficmon stop
-        
-        Troubleshooting:
-        ================
-        
+        ```bash
+        nft list table inet trafficmon
+        ```
+
+        ## 🔄 Updates
+
+        To update to a new version:
+        ```bash
+        opkg remove trafficmon
+        opkg install /tmp/trafficmon-*.ipk
+        ```
+
+        ## 🐛 Troubleshooting
+
         Check if service is running:
-           ps | grep trafficmon
-        
+        ```bash
+        ps | grep trafficmon
+        ```
+
         View logs:
-           logread | grep trafficmon
-        
-        Test nftables manually:
-           nft list ruleset | grep trafficmon
-        
-        Uninstall:
-           opkg remove trafficmon
-        
-        For issues and source code:
-        https://github.com/stevenke1981/trafficmon-rust
+        ```bash
+        logread | grep trafficmon
+        ```
+
+        ## 📝 Changelog
+
+        See [CHANGELOG.md](CHANGELOG.md) for details.
+
+        ## 🔐 Checksums
+
+        Verify file integrity using SHA256SUMS or MD5SUMS included in this release.
+
+        ---
+
+        Built with OpenWrt ${{ env.OPENWRT_VERSION }} SDK
         EOF
         
-        cat release/README.txt
+        cat release/RELEASE_NOTES.md
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ steps.get_version.outputs.version }}
+        name: Release ${{ steps.get_version.outputs.version }}
+        body_path: release/RELEASE_NOTES.md
+        draft: false
+        prerelease: false
+        files: |
+          release/*.ipk
+          release/SHA256SUMS
+          release/MD5SUMS
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
