@@ -139,7 +139,7 @@ jobs:
             libreadline-dev libssl-dev libtool libyaml-dev libz-dev lld llvm lrzsz mkisofs msmtp nano \
             ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip python3-ply python3-docutils \
             python3-pyelftools qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo uglifyjs \
-            upx-ucl unzip vim wget xmlto xxd zlib1g-dev zstd jq
+            upx-ucl unzip vim wget xmlto xxd zlib1g-dev zstd jq gcc-aarch64-linux-gnu
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -407,14 +407,19 @@ EOF
       - name: Compile package
         id: compile
         run: |
-          cd sdk
-          echo "CONFIG_ALL_NONSHARED=n" > .config
-          echo "CONFIG_ALL_KMODS=n" >> .config
-          echo "CONFIG_ALL=n" >> .config
-          echo "CONFIG_AUTOREMOVE=n" >> .config
-          echo "CONFIG_PACKAGE_trafficmon=m" >> .config
-          echo "CONFIG_PACKAGE_nftables=y" >> .config
-          echo "CONFIG_PACKAGE_kmod-nft-core=y" >> .config
+           cd sdk
+    # 禁用所有內核模塊編譯
+    echo "CONFIG_ALL_NONSHARED=n" > .config
+    echo "CONFIG_ALL_KMODS=n" >> .config
+    echo "CONFIG_ALL=n" >> .config
+    echo "CONFIG_AUTOREMOVE=n" >> .config
+    # 禁用有問題的內核模塊
+    echo "CONFIG_PACKAGE_kmod-gpio-button-hotplug=n" >> .config
+    echo "CONFIG_PACKAGE_kmod-button-hotplug=n" >> .config
+    # 啟用我們需要的包
+    echo "CONFIG_PACKAGE_trafficmon=m" >> .config
+    echo "CONFIG_PACKAGE_nftables=y" >> .config
+    echo "CONFIG_PACKAGE_kmod-nft-core=y" >> .config
           
           make defconfig
           
