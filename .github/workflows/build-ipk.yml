@@ -87,7 +87,6 @@ jobs:
           gcc-aarch64-linux-gnu \
           g++-aarch64-linux-gnu \
           musl-tools \
-          musl-dev
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
